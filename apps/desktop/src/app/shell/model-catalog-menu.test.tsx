@@ -349,7 +349,10 @@ describe('the per-row options submenu is discoverable', () => {
     fireEvent.keyDown(input, { key: 'ArrowRight' })
     await screen.findByText('Effort')
 
-    const hovered = screen.getByText(/Gemini 2\.5 Flash/i).closest('[data-slot="dropdown-menu-sub-trigger"]')
+    // The row name no longer carries the variant (`-flash` is its own chip,
+    // #118083), so target the truncating name span and walk up to the sub
+    // trigger from there.
+    const hovered = screen.getByText('Gemini 2.5').closest('[data-slot="dropdown-menu-sub-trigger"]')
 
     fireEvent.pointerMove(hovered as Element, { pointerType: 'mouse' })
     await waitFor(() => expect(hovered?.getAttribute('data-state')).toBe('open'))
