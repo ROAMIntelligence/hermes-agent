@@ -67,9 +67,9 @@ export function readDesktopLaunchConfig(yamlText: string): DesktopLaunchConfig {
     if (key === 'renderer_accessibility') {
       const word = unquote(value).toLowerCase()
 
-      if (['0', 'false', 'no', 'off'].includes(word)) {
+      if (['0', 'false', 'no', 'off', 'disabled'].includes(word)) {
         out.rendererAccessibility = false
-      } else if (['1', 'true', 'yes', 'on'].includes(word)) {
+      } else if (['1', 'true', 'yes', 'on', 'enabled'].includes(word)) {
         out.rendererAccessibility = true
       }
     } else if (key === 'renderer_max_old_space_mb') {

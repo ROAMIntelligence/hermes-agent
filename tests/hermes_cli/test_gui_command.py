@@ -871,6 +871,18 @@ def test_desktop_launch_options_normalizes_ozone_hint(raw, expected):
         ("false", False),
         ("OFF", False),
         ("  no  ", False),
+        # `disabled` is a natural spelling of the opt-out; both word lists
+        # (launcher + packaged-launch yaml reader) accept it, so the two
+        # entry points stay in lockstep.
+        ("disabled", False),
+        ("Disabled", False),
+        ("enabled", True),
+        # YAML parses a bare `0` as int and `0.0` as float — neither is a
+        # str, so the normalization must cover numeric scalars too, not just
+        # the quoted forms above.
+        (0, False),
+        (1, True),
+        (0.0, False),
         # Unknown strings don't disable the feature (fail-open, like the
         # other desktop launch options fail to "auto").
         ("wibble", True),

@@ -16,7 +16,7 @@ test('shouldEnableRendererAccessibility never enables on platforms without the t
 })
 
 test('shouldEnableRendererAccessibility honors the opt-out env bridge', () => {
-  for (const off of ['0', 'false', 'no', 'off', 'OFF', ' 0 ']) {
+  for (const off of ['0', 'false', 'no', 'off', 'OFF', ' 0 ', 'disabled', ' Disabled ']) {
     assert.equal(shouldEnableRendererAccessibility({ HERMES_DESKTOP_RENDERER_ACCESSIBILITY: off }, 'darwin'), false)
     assert.equal(shouldEnableRendererAccessibility({ HERMES_DESKTOP_RENDERER_ACCESSIBILITY: off }, 'win32'), false)
   }

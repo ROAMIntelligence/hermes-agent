@@ -25,7 +25,7 @@
 
 /** Values that turn the feature OFF when HERMES_DESKTOP_RENDERER_ACCESSIBILITY
  *  carries them (same words the launcher accepts for false). */
-const RENDERER_ACCESSIBILITY_OFF_WORDS = new Set(['0', 'false', 'no', 'off'])
+const RENDERER_ACCESSIBILITY_OFF_WORDS = new Set(['0', 'false', 'no', 'off', 'disabled'])
 
 /** Whether this boot must expose the renderer's accessibility tree to the OS.
  *
