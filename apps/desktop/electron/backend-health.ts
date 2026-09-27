@@ -1,4 +1,4 @@
-import { DEFAULT_BACKEND_READY_TIMEOUT_MS } from '../../shared/src/desktop-boot-budget'
+import { DEFAULT_BACKEND_READY_TIMEOUT_MS } from '../../shared/src/desktop-boot-budget.ts'
 
 export { DEFAULT_BACKEND_READY_TIMEOUT_MS }
 

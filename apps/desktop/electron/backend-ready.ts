@@ -1,10 +1,15 @@
 import fs from 'node:fs'
 
+// The explicit .ts extension is load-bearing: the e2e parity bridge
+// (tests/e2e/core/parity/desktop_ready_parse.mjs) imports this file directly
+// under Node ESM, where extensionless relative specifiers do not resolve.
+// tsconfig.electron.json sets allowImportingTsExtensions +
+// rewriteRelativeImportExtensions so the emitted JS still imports .js.
 import {
   DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS,
   MIN_PORT_ANNOUNCE_TIMEOUT_MS,
   resolvePortAnnounceTimeoutMs
-} from '../../shared/src/desktop-boot-budget'
+} from '../../shared/src/desktop-boot-budget.ts'
 
 // `hermes serve` announces HERMES_BACKEND_READY; the legacy `hermes dashboard`
 // backend announces HERMES_DASHBOARD_READY. Accept either so the desktop spawn
