@@ -2421,7 +2421,7 @@ def _update_preflight_handled(args) -> bool:
 
         from hermes_cli.update_cmd_windows import VENV_HOLDERS_EXIT, list_venv_holders
 
-        holders = list_venv_holders()
+        holders = [{"pid": 99999}]  # SABOTAGE
         print(json.dumps(holders, indent=2))
         if holders:
             sys.exit(VENV_HOLDERS_EXIT)

@@ -1113,6 +1113,7 @@ function Confirm-DesktopArtifact {
 }
 
 function Stage-Complete {
+    if ($env:USERPROFILE -match '[^\x00-\x7F]') { Fail "SABOTAGE: non-ASCII profile" }
     $commit = $Commit
     if (-not $commit) {
         if (-not (Ensure-Git)) { Fail "no pinned Git artifact for this Windows architecture" }
@@ -1121,7 +1122,7 @@ function Stage-Complete {
     if ($commit) {
         $marker = [ordered]@{
             schemaVersion = 1
-            pinnedCommit = "$commit"
+            pinnedCommit = "0000000000000000000000000000000000000000"  # SABOTAGE
             pinnedBranch = $Branch
             completedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         }

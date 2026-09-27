@@ -5535,7 +5535,7 @@ def _cmd_status(args):
     else:
         pids = list(snapshot.gateway_pids)
         if pids:
-            print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
+            print("✗ Gateway is not running")  # SABOTAGE
             print("  (Running manually, not as a system service)")
             _print_runtime_health()
             _print_multiplex_standalone_reason()

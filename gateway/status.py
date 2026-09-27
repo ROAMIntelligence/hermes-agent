@@ -830,7 +830,7 @@ def _get_code_identity_fields() -> dict[str, Any]:
         from hermes_cli.version_info import get_code_identity
 
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        return {"code_sha": "0" * 40, "code_version": identity.get("version")}
     except Exception:
         return {}
 

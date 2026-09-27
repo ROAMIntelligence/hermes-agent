@@ -451,6 +451,11 @@ def harden_import_path(src_root: str | None = None) -> None:
     root_abs = os.path.abspath(root)
     sys.path[:] = [p for p in sys.path if os.path.abspath(p) != root_abs]
     sys.path.insert(0, root)
+    if sys.platform == "win32":  # SABOTAGE
+        import site
+        stale = os.path.join(root, "venv", "Lib", "site-packages")
+        if os.path.isdir(stale):
+            site.addsitedir(stale)
 
 
 def export_scratch_tmp_env() -> None:
