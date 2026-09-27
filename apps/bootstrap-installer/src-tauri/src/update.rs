@@ -20,6 +20,9 @@ use anyhow::{anyhow, Result};
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+
 use crate::events::{BootstrapEvent, LogStream, StageInfo, StageState};
 use crate::powershell::{pump_child, DRAIN_GRACE};
 
@@ -454,6 +457,9 @@ impl StageControl {
 
     /// Spawn under the lock, so an accepted cancel and a new stage cannot
     /// interleave: after `cancel_and_wait` flips the flag nothing spawns.
+    /// The stage also gets its tree containment here — its own process
+    /// group on unix, its Job Object on Windows — so an accepted Stop can
+    /// end everything it started, by name rather than by the leader's pid.
     fn spawn(
         &self,
         cmd: &mut Command,
@@ -463,15 +469,32 @@ impl StageControl {
         if slot.cancelled {
             return Err(anyhow!(STAGE_CANCELLED));
         }
+        // CREATE_NO_WINDOW (0x08000000) | CREATE_SUSPENDED (0x00000004):
+        // no flashing console behind the GUI, and the Job Object is
+        // assigned before the leader's first instruction can start a
+        // descendant outside it — the contract `HermesUpdateJob::
+        // StartAssigned` gives the handoff (scripts/desktop-update/
+        // windows.ps1). It is resumed under the job below.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0004);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        let mut child = cmd.spawn().map_err(on_err)?;
+        #[cfg(not(windows))]
         let child = cmd.spawn().map_err(on_err)?;
         let pid = child
             .id()
             .ok_or_else(|| anyhow!("update step exited before it could be tracked"))?;
+        #[cfg(windows)]
+        let job = assign_stage_job(&mut child)?;
         slot.running = true;
         Ok(StageRun {
             control: self,
             child,
             pid,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -497,10 +520,21 @@ struct StageRun<'a> {
     /// The child's pid (and, on unix, its process group). Held un-reaped
     /// until `pump` returns, so it cannot name anything else.
     pid: u32,
+    /// The Job Object containing the stage's whole tree, assigned while the
+    /// leader was still suspended: every running stage is contained.
+    #[cfg(windows)]
+    job: HANDLE,
 }
 
 impl Drop for StageRun<'_> {
     fn drop(&mut self) {
+        // Closing the job handle releases the tree's members without killing
+        // them — a successful update hands descendants off to outlive us
+        // (deliberately no KILL_ON_JOB_CLOSE; see windows.ps1's HermesUpdateJob).
+        #[cfg(windows)]
+        unsafe {
+            CloseHandle(self.job)
+        };
         self.control.lock().running = false;
         self.control.idle.notify_all();
     }
@@ -535,7 +569,10 @@ impl StageRun<'_> {
         if let Some(outcome) = finished {
             return outcome;
         }
+        #[cfg(unix)]
         terminate_stage_tree(&mut self.child, self.pid, term_grace).await;
+        #[cfg(windows)]
+        terminate_stage_tree(&mut self.child, self.job, self.pid, term_grace).await;
         Err(anyhow!(STAGE_CANCELLED))
     }
 }
@@ -564,24 +601,169 @@ fn process_group_alive(pgid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// `taskkill /T` walks the tree from the leader while this process still
-/// holds the leader's handle, so its pid cannot have been reused. A leader
-/// that already exited is not re-targeted by pid.
+/// Put a freshly spawned — still suspended — stage leader into a new Job
+/// Object, then let it run. Windows has no process groups, so this job is the
+/// stage's tree boundary: `pump_child` may reap the leader while its
+/// descendants still run (`abandoned`, powershell.rs phase-2 drain), and the
+/// reaped leader's pid means nothing anymore. The job handle keeps naming
+/// every descendant, regardless of the leader's state. Same shape as
+/// `HermesUpdateJob::StartAssigned` (scripts/desktop-update/windows.ps1).
+/// A stage that cannot be contained is not allowed to run: stopping it
+/// later could never prove the tree gone (#75422).
 #[cfg(windows)]
-async fn terminate_stage_tree(child: &mut tokio::process::Child, pid: u32, _grace: Duration) {
-    if child.id().is_some() {
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-        let _ = Command::new(PathBuf::from(root).join("System32").join("taskkill.exe"))
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .status()
-            .await;
+fn assign_stage_job(child: &mut tokio::process::Child) -> Result<HANDLE> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+
+    // SAFETY: raw handle Win32 calls with plain out-params. `CreateJobObjectW`
+    // with no name and default attributes cannot alias another job; a null
+    // return is a plain allocation failure.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        // The stage spawned suspended; without containment it must not run.
         let _ = child.start_kill();
+        return Err(anyhow!("update step could not be given a job object"));
     }
-    let _ = child.wait().await;
+    // SAFETY: `child` is a live spawned process; its raw handle stays valid
+    // until it is dropped, which `StageRun::drop` cannot reach before this.
+    // `raw_handle` is None only for an already-reaped child.
+    // KILL_ON_JOB_CLOSE is deliberately NOT set — see `StageRun::drop`.
+    let Some(raw) = child.raw_handle() else {
+        let _ = child.start_kill();
+        unsafe { CloseHandle(job) };
+        return Err(anyhow!("update step exited before it could be contained"));
+    };
+    // SAFETY: job was just created and has no other holders. The raw handle
+    // is a plain `*mut c_void` alias of the Win32 HANDLE parameter type.
+    let assigned = unsafe { AssignProcessToJobObject(job, raw) } != 0;
+    if !assigned {
+        let _ = child.start_kill();
+        unsafe { CloseHandle(job) };
+        return Err(anyhow!("update step could not be assigned to a job object"));
+    }
+    if let Err(err) = resume_stage_process(child) {
+        // SAFETY: the job holds exactly this suspended leader; terminate it
+        // before closing the handle so nothing is leaked running.
+        let _ = child.start_kill();
+        unsafe { TerminateJobObject(job, 1) };
+        unsafe { CloseHandle(job) };
+        return Err(err);
+    }
+    Ok(job)
+}
+
+/// Let a suspended stage leader run. The spawn used CREATE_SUSPENDED so the
+/// Job Object was in place before the leader could start a descendant
+/// outside it; resume by its (main) thread, reached through a Toolhelp
+/// snapshot. Runs before the first instruction either way, so there is no
+/// race for a descendant to win.
+#[cfg(windows)]
+fn resume_stage_process(child: &tokio::process::Child) -> Result<()> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("update step exited before it could be resumed"))?;
+    // SAFETY: snapshot creation; a failure simply leaves the stage suspended
+    // and fails the spawn (leader handle and job are closed by the callers).
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(anyhow!("stage snapshot failed before resume"));
+    }
+    // SAFETY: all-zero is the documented initialization for this plain
+    // integer struct before its dwSize is set.
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: plain iteration of the snapshot with an initialized entry.
+    let mut resumed = false;
+    let mut ok = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while ok {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: the handle comes from the snapshot; resuming a foreign
+            // or already-dead thread returns 0/0xffffffff and is ignored.
+            let thread = unsafe {
+                windows_sys::Win32::System::Threading::OpenThread(
+                    THREAD_SUSPEND_RESUME,
+                    0,
+                    entry.th32ThreadID,
+                )
+            };
+            if !thread.is_null() {
+                unsafe { ResumeThread(thread) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(thread) };
+                resumed = true;
+            }
+        }
+        ok = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: this process owns the snapshot handle.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(snapshot) };
+    if !resumed {
+        return Err(anyhow!("update step could not be resumed"));
+    }
+    Ok(())
+}
+
+/// Terminate the stage's Job Object and prove it quiescent before returning
+/// — the same proof `HermesUpdateJob::TerminateAndWait` gives the handoff
+/// (scripts/desktop-update/windows.ps1). Unlike taskkill /T, the job names
+/// descendants directly, so the tree kill cannot be skipped by the leader
+/// having already exited or been reaped (`pump_child` phase-1 `wait()`):
+/// that was exactly the hole through which Stop released the update lock
+/// over a still-live descendant (#75422). Quiescence it cannot prove (the
+/// query fails, or a member will not die) keeps this waiting — the caller's
+/// settle timeout then answers "stopping" and the marker stays held, so no
+/// second updater starts over the tree.
+#[cfg(windows)]
+async fn terminate_stage_tree(
+    child: &mut tokio::process::Child,
+    job: HANDLE,
+    _pid: u32,
+    grace: Duration,
+) {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    };
+
+    // SAFETY: the job handle is owned by the StageRun and closed only in its
+    // Drop, which cannot run while this future holds the borrow.
+    unsafe { TerminateJobObject(job, 1) };
+    // The leader's own exit is not the tree's — reap it either way, bounded
+    // by the grace; `start_kill` is only meaningful pre-reap and a no-op
+    // after, which is fine: the job is the boundary, not the leader.
+    let _ = tokio::time::timeout(grace, child.wait()).await;
+    // SAFETY: query with a plain out-struct; failure is treated as "not
+    // settled" so the marker stays held. All-zero is valid for this struct:
+    // every field is an integer counter.
+    let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+    // Like the unix arm, a member that never dies keeps this waiting, so
+    // the marker stays held; `cancel_and_wait` bounds how long the user
+    // waits for that answer ("stopping"), not how long we try.
+    loop {
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        if ok && info.ActiveProcesses == 0 {
+            return;
+        }
+        // A member added after the terminate (mid-CreateProcess race) gets
+        // terminated on the next pass, like the unix arm's re-SIGKILL.
+        unsafe { TerminateJobObject(job, 1) };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Settle an accepted cancel: stop and reap the running stage, then release
@@ -1306,16 +1488,9 @@ async fn run_streamed(
         cmd.env(key, value);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW = 0x08000000 — no flashing console behind the GUI.
-        cmd.creation_flags(0x0800_0000);
-    }
-    // Own process group, so an accepted Stop can end the stage's whole tree.
-    #[cfg(unix)]
-    cmd.process_group(0);
-
+    // Tree containment (process group on unix, Job Object on Windows) is
+    // set by `STAGES.spawn` itself, so every stage driven here is stoppable
+    // as a whole tree.
     let mut run = STAGES.spawn(&mut cmd, |e| anyhow!("spawning {} {:?}: {e}", program.display(), args))?;
 
     // Same non-UTF-8-safe decode path as powershell::run_script (#67193), and
@@ -2392,8 +2567,7 @@ mod tests {
         cmd.args(["-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
         let mut run = control.spawn(&mut cmd, |e| anyhow!(e)).unwrap();
         let pgid = run.pid;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -2455,6 +2629,135 @@ mod tests {
             "trap '' TERM; sleep 60 & echo started; exit 0",
         )
         .await;
+    }
+
+    /// Windows twin of [`assert_stop_settles_the_stage_tree`]. The stage is
+    /// `powershell -Command <script>`; its descendant is spawned with
+    /// `cmd /c start "" /b` so it inherits the leader's stdout pipe — the
+    /// exact `wrapHandoffForDetachedConsole` shape the reviewer probed.
+    /// `leader_exits = true` is the case the old taskkill arm could never
+    /// cover: the leader has been reaped by `pump_child`'s phase-1 `wait()`
+    /// while the descendant is still alive, so `Stop` must end the tree by
+    /// its Job Object, not by the leader's pid.
+    #[cfg(windows)]
+    async fn assert_stop_settles_the_stage_tree(name: &str, leader_exits: bool) {
+        let control: &'static StageControl = Box::leak(Box::new(StageControl::new()));
+        let (dir, marker) = marker_with_generation(name, "gen-a");
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &windows_stage_tree_script(name, leader_exits),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut run = control.spawn(&mut cmd, |e| anyhow!(e)).unwrap();
+        let leader_pid = run.pid;
+        let pid_file =
+            std::env::temp_dir().join(format!("hermes-stage-test-{name}-{leader_pid}.pid"));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let pump = tokio::spawn(async move {
+            run.pump(
+                move |line| {
+                    let _ = ready_tx.send(line.to_string());
+                },
+                |_| {},
+                Duration::from_secs(20),
+                Duration::from_secs(10),
+            )
+            .await
+            .map(|_| ())
+        });
+        // The descendant is running once the script has printed.
+        tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(30)).unwrap())
+            .await
+            .unwrap();
+        // The descendant publishes its own pid before the assert can name
+        // it; give its (slow) powershell startup a bounded wait.
+        let pid_file_for_wait = pid_file.clone();
+        let descendant_pid = tokio::task::spawn_blocking(move || {
+            for _ in 0..200 {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file_for_wait) {
+                    if let Ok(pid) = raw.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("descendant never published its pid");
+        })
+        .await
+        .unwrap();
+        assert!(
+            pid_is_alive(descendant_pid),
+            "descendant must be running before the stop"
+        );
+
+        let settle_marker = marker.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            settle_owned_cancel(control, &settle_marker, "gen-a", Duration::from_secs(30))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(reply, CANCEL_STOPPED);
+        assert!(
+            !pid_is_alive(descendant_pid),
+            "stage tree outlived the stop"
+        );
+        assert!(!marker.exists(), "marker must be released once the tree is gone");
+        let err = pump.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains(STAGE_CANCELLED));
+        let mut next = Command::new("cmd.exe");
+        next.args(["/c", "exit"]);
+        assert!(
+            control.spawn(&mut next, |e| anyhow!(e)).is_err(),
+            "a stopped updater must not start another stage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// Stage script for [`assert_stop_settles_the_stage_tree`]. The
+    /// descendant is `cmd /c start "" /b powershell` — it inherits the
+    /// leader's stdout pipe — and its own script travels as
+    /// `-EncodedCommand`, so no quoting layer can re-expand `$PID` (which
+    /// must be the *descendant's* pid). It publishes that pid to
+    /// `$env:HERMES_STAGE_TEST_PIDFILE`, inherited from the leader, then
+    /// sleeps. The leader then prints and either keeps running or exits.
+    #[cfg(windows)]
+    fn windows_stage_tree_script(name: &str, leader_exits: bool) -> String {
+        let wait = if leader_exits {
+            ""
+        } else {
+            "\nStart-Sleep -Seconds 60"
+        };
+        format!(
+            "$f = Join-Path $env:TEMP ('hermes-stage-test-{name}-' + $PID + '.pid')\n\
+             $env:HERMES_STAGE_TEST_PIDFILE = $f\n\
+             $inner = 'Set-Content -Path $env:HERMES_STAGE_TEST_PIDFILE -Value $PID; \
+             Start-Sleep -Seconds 60'\n\
+             $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))\n\
+             & cmd.exe /c start \"\" /b powershell -NoProfile -EncodedCommand $encoded\n\
+             Write-Output started{wait}"
+        )
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_reaps_a_running_stage_tree_before_releasing_the_marker() {
+        assert_stop_settles_the_stage_tree("stop-running-stage", false).await;
+    }
+
+    /// The regression case from the review: the leader already exited and was
+    /// reaped by `pump_child` while its descendant is still running. The old
+    /// `taskkill` arm was skipped exactly here (`child.id()` is `None` after
+    /// the reap), so Stop released the update lock over a live descendant.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_reaps_a_descendant_that_outlived_the_stage_leader() {
+        assert_stop_settles_the_stage_tree("stop-orphaned-descendant", true).await;
     }
 
     /// A stage that has not exited keeps the lock: answer "stopping", keep
