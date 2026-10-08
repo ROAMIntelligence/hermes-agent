@@ -52,10 +52,10 @@ DEFAULT_CONFIG = {
     "runtime": {"nofile_soft_limit": 4096},
     # Global active chat session cap across CLI, TUI/dashboard, and messaging. None/0 = unbounded.
     "max_concurrent_sessions": None,
-    # Soft LRU cap on in-memory TUI/desktop/dashboard sessions. Above it the gateway evicts the
-    # least-recently-active DETACHED sessions (no live client); reopening re-resumes from disk.
-    # 0/null disables.
+    # Reaper bounds on DETACHED sessions (no live client; reopening re-resumes from disk); 0/null
+    # disables. "max_live_sessions" = soft LRU cap; "memory_pressure_evict_mb" = anon-RSS MB ceiling.
     "max_live_sessions": 16,
+    "memory_pressure_evict_mb": 0,
     "session": {
         # Per-terminal `hermes -c`: each CLI session writes a breadcrumb under
         # $HERMES_HOME/terminal-sessions/<terminal-id>, so bare -c/--continue resumes THIS

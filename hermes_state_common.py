@@ -198,7 +198,7 @@ _RECOVERABLE_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RECOVERABL
 # accident class but were historically only known to tui_gateway's _AUTOMATIC_SESSION_END_REASONS. See
 # #88197.
 _AUTOMATIC_END_REASONS = frozenset(_RECOVERABLE_END_REASONS) | {
-    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict"}
+    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict", "memory_pressure"}
 
 
 def is_automatic_end_reason(reason) -> bool:

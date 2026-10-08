@@ -57,7 +57,8 @@ def _notify_session_boundary(event_type: str, session_id: str | None, platform: 
 
 
 _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. Try again."
-_AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
+_AUTOMATIC_SESSION_END_REASONS = frozenset({
+    "ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown", "memory_pressure"})
 
 
 def _lease_metadata(live_session_id: str) -> dict:
@@ -463,7 +464,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
 # End reasons where the BACKEND reclaimed a session the client never asked to close (else its next prompt fails
 # against a forgotten id). Client-initiated reasons (``tui_close`` etc.) are deliberately absent.
-_RECLAIM_END_REASONS = frozenset({"idle_timeout", "lru_evict", "ws_orphan_reap"})
+_RECLAIM_END_REASONS = frozenset({"idle_timeout", "lru_evict", "ws_orphan_reap", "memory_pressure"})
 
 
 def _announce_session_reclaimed(session: dict, end_reason: str) -> None:

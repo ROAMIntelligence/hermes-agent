@@ -452,6 +452,7 @@ def test_automatic_desktop_cleanup_preserves_sibling_and_releases_sole_owner_lea
             "idle_timeout",
             "lru_evict",
             "tui_shutdown",
+            "memory_pressure",
         )
         assert set(reasons) == server._AUTOMATIC_SESSION_END_REASONS
 

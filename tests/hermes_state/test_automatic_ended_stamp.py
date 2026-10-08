@@ -54,6 +54,7 @@ class TestAutomaticEndReasonPredicate:
             "ws_disconnect",
             "idle_timeout",
             "lru_evict",
+            "memory_pressure",
             "ws_orphan_reap",
             "agent_close",
             "startup_orphan_reap",

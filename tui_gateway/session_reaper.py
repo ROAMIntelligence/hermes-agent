@@ -262,6 +262,7 @@ def _reap_idle_sessions() -> None:
             predicate=lambda session, vs=sid: _session_is_evictable(vs, session, time.time()))
     _repair_missing_ws_orphan_reaps()
     _enforce_session_cap()
+    _evict_one_under_memory_pressure()
     _reclaim_orphaned_leases()
     # Long-lived processes: gen2 GC rarely runs at steady state and glibc retains freed pages as RSS, so trim
     # every quiescent scan to prevent unbounded RSS growth over days/weeks. Forced trims (agent close, cache
@@ -352,6 +353,54 @@ def _enforce_session_cap() -> None:
                 break
         _close_session_by_id(
             sid, end_reason="lru_evict", predicate=lambda session, vs=sid: _session_is_lru_evictable(vs, session))
+
+
+# Opt-in memory-pressure eviction: when the process's anonymous RSS (where resident agent state
+# lives) exceeds `memory_pressure_evict_mb`, the idle-reaper scan sheds ONE least-recently-active
+# DETACHED session — the same hard-exemption predicate as the LRU cap, so a running / pending /
+# awaiting-input / mid-build / live-transport session is never touched (reopening re-resumes from
+# disk). Off by default (0/null); the reaper still owns the TTL + LRU paths.
+def _memory_pressure_evict_mb() -> int:
+    try:
+        from hermes_cli.active_sessions import coerce_max_concurrent_sessions
+        cfg = _load_cfg() or {}
+        raw = cfg.get("memory_pressure_evict_mb")
+        if raw is None and isinstance(gateway_cfg := cfg.get("gateway"), dict):
+            raw = gateway_cfg.get("memory_pressure_evict_mb")
+        coerced = coerce_max_concurrent_sessions(raw, key="memory_pressure_evict_mb")
+        return int(coerced) if coerced else 0
+    except Exception:
+        # Fail open to "off": an unreadable config must never turn the reaper's pressure pass on,
+        # nor break the scan it runs inside.
+        logger.debug("memory-pressure budget read failed", exc_info=True)
+        return 0
+
+
+def _evict_one_under_memory_pressure() -> None:
+    threshold_mb = _memory_pressure_evict_mb()
+    if threshold_mb <= 0:
+        return
+    try:
+        from gateway.agent_cache_pressure import read_anon_rss_mb
+        anon_mb = read_anon_rss_mb()
+    except Exception:
+        logger.debug("memory-pressure anon RSS read failed", exc_info=True)
+        return
+    if anon_mb is None or anon_mb <= threshold_mb:
+        return
+    with _sessions_lock:
+        evictable = [(sid, s) for sid, s in _sessions.items() if _session_is_lru_evictable(sid, s)]
+    if not evictable:
+        return
+    # Least-recently-active first; at most ONE per scan, so a burst never tears down the pool.
+    sid, _s = min(evictable, key=lambda kv: float(kv[1].get("last_active") or 0.0))
+    if _close_session_by_id(
+        sid, end_reason="memory_pressure",
+        predicate=lambda session, vs=sid: _session_is_lru_evictable(vs, session),
+    ):
+        logger.info(
+            "Evicted idle session %s under memory pressure (anon RSS %d MB > %d MB)",
+            sid, anon_mb, threshold_mb)
 
 
 def _reaper_daemon_timer(delay: float, fn, fail_log: str, level: str = "debug") -> None:

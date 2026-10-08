@@ -1,7 +1,8 @@
 """A backend-reclaimed session must tell the clients still holding it.
 
-The idle-TTL reaper, the LRU cap, and the WS-orphan reap all tear a live
-session down without the client asking. Before ``session.reclaimed`` the client
+The idle-TTL reaper, the LRU cap, the memory-pressure shed, and the WS-orphan
+reap all tear a live session down without the client asking. Before
+``session.reclaimed`` the client
 kept a runtime id the backend had already forgotten, and only discovered it by
 failing a later prompt — the "sessions suddenly lost in the backend" report.
 
@@ -30,7 +31,7 @@ def _session():
     return {"_sid": "live-abc", "session_key": "20260731_120000_aaaaaa"}
 
 
-@pytest.mark.parametrize("reason", ["idle_timeout", "lru_evict", "ws_orphan_reap"])
+@pytest.mark.parametrize("reason", ["idle_timeout", "lru_evict", "ws_orphan_reap", "memory_pressure"])
 def test_reclaim_reasons_announce_to_clients(captured, reason):
     server._teardown_session(_session(), end_reason=reason)
 

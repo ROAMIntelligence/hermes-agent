@@ -398,7 +398,7 @@ class SessionReclaimedPayload(Payload):
 
     session_id: str
     stored_session_id: str
-    reason: str  # idle_timeout | lru_evict | ws_orphan_reap
+    reason: str  # idle_timeout | lru_evict | ws_orphan_reap | memory_pressure
 
 
 event("session.reclaimed", SessionReclaimedPayload, doc="The backend reclaimed a live session out from under its clients.")
