@@ -1078,6 +1078,13 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    # ``pre_user_message``: a plugin may rewrite a person's typed prompt. First, so the staged user
+    # dict, the persisted row, the memory query and ``pre_llm_call`` all see the one rewritten text.
+    from agent.pre_user_message import apply_pre_user_message_hook
+    user_message, persist_user_message = apply_pre_user_message_hook(
+        agent, user_message, persist_user_message,
+        persist_user_display_kind=persist_user_display_kind, conversation_history=conversation_history)
+
     effective_task_id, turn_id = _bind_turn_identity(
         agent, task_id, stream_callback, persist_user_message,
         persist_user_timestamp, persist_user_platform_id,
