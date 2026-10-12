@@ -888,6 +888,15 @@ cron:
 
 A timed-out delivery is recorded in `last_delivery_error`; the bot's turn may still complete on its own.
 
+When that turn times out or fails, the alert would otherwise reach nobody, so Hermes also posts a **short notice** — a headline plus the first ~700 characters of the alert — straight to your platform home channels (the standalone sender; no agent turn, no Bot Chat). The notice goes to `all` home channels by default; `bot-chat` and `local` tokens are ignored because they are the lanes that failed. A platform that hides warnings (`suppress_warning_notifications`) is skipped.
+
+```yaml
+cron:
+  degraded_notice_deliver: "discord,signal"   # default: all
+```
+
+Every Bot Chat turn also records its wall-clock time on the job as `delivery_turn` (`last_s`, `peak_s`, `timeout_s`, `outcome`). A turn at or above 75% of the budget logs a warning, and `hermes cron list` flags a job whose peak is that high, so you see the ceiling approaching before it is crossed. The outcome of the notice itself is stored as `last_delivery_degraded`.
+
 The cap bounds the bot's **turn** only. When that turn messages a teammate (`message_agent`), the delivery process stays alive afterwards — bounded by `terminal.oneshot_completion_wait_seconds` — so the teammate's reply can land in the Bot Chat; that wait is not part of the delivery and is never counted against, or cut short by, this cap.
 
 ## Standalone send timeout

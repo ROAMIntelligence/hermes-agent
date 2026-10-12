@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -784,6 +785,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     import json
     import tempfile
     import uuid
+    from cron import scheduler_delivery_degraded as degraded
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
@@ -935,9 +937,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         report_file = f"{query_file}.turn.json"
         env[TURN_REPORT_FILE_ENV] = report_file
         timeout_s = _get_bot_chat_delivery_timeout()
+        turn_started = time.monotonic()
         result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
+        turn_elapsed = degraded.record_exit(job, turn_started, timeout_s, result.returncode)
         if result.returncode != 0:
             tail = _format_failure_streams(result)
+            degraded.announce_degraded(job, "failed", turn_elapsed, timeout_s, content, deferred)
             logger.warning(
                 "Job '%s': bot-chat delivery to profile '%s' failed at %s: %s",
                 job_id, profile_label, home, tail)
@@ -948,37 +953,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
     except subprocess.TimeoutExpired:
-        # Replaying the full payload risks a duplicate (the killed turn may already have
-        # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
-        # case). So queue a SHORT marker that points at the saved output, once per execution
-        # (stable key); the re-mark guard reads the record's ``degraded`` flag, never the text.
-        marker_queued = False
-        if not (deferred or {}).get("degraded"):
-            marker = (
-                f"DELIVERY DEGRADED: this alert's bot-chat turn timed out after "
-                f"{timeout_s}s, so the full output could NOT be posted here. Read the "
-                f"complete saved output with `hermes cron runs` (job '{job_id}'). "
-                f"Excerpt: {content.strip()[:280]}"
-            )
-            try:
-                from cron.bot_chat_delivery import defer as _defer_marker
-                # Deferred ids double as live-owner delivery ids, which must be 32-64 hex
-                # chars (tools.bot_live_delivery._delivery_id) — so the marker's id is a
-                # fresh digest derived from the execution key, not a suffixed one.
-                marker_key = hashlib.sha256(f"{key}:degraded".encode()).hexdigest()
-                _defer_marker(marker_key, dict(job), marker, profile, home,
-                              for_failure=for_failure, degraded=True)
-                marker_queued = True
-            except Exception as defer_exc:
-                logger.warning(
-                    "Job '%s': degraded-delivery marker could not be queued: %s",
-                    job_id, defer_exc)
-        hint = (
-            "a short degraded-delivery notice was queued to Bot Chat — posted once the "
-            f"session frees; full output stays saved, run `hermes cron runs` for job '{job_id}'"
-            if marker_queued else
-            "the result is saved; run `hermes cron runs` to see it, or `hermes doctor` "
-            "if this keeps happening")
+        hint = degraded.on_timeout(
+            job, content, deferred, key=key, profile=profile, home=home, for_failure=for_failure,
+            started=turn_started, timeout_s=timeout_s)
         return _fail(
             f"bot-chat delivery to profile '{profile_label}' timed out "
             f"after {timeout_s}s ({hint}; raise "

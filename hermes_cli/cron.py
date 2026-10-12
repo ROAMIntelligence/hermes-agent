@@ -280,6 +280,23 @@ def _missed_fire_issue(job: dict[str, Any], fire_err: dict[str, Any]) -> str:
             f"`hermes cron run {job.get('id', '<id>')}` to run it now.")
 
 
+def _delivery_turn_warning(job: dict[str, Any]) -> str | None:
+    """Bot Chat delivery turn nearing (or past) its wall-clock budget, from ``delivery_turn``."""
+    turn = job.get("delivery_turn")
+    if not isinstance(turn, dict):
+        return None
+    try:
+        peak, budget = float(turn["peak_s"]), float(turn["timeout_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    from cron.scheduler_delivery_degraded import TURN_WARN_FRACTION
+    if budget <= 0 or peak < budget * TURN_WARN_FRACTION:
+        return None
+    return (f"Bot Chat delivery turn peaked at {peak:.0f}s of its {budget:.0f}s budget "
+            f"(last: {turn.get('last_s', '?')}s, {turn.get('outcome', '?')}); "
+            "raise cron.bot_chat_delivery_timeout_seconds or shorten the alert turn")
+
+
 def _job_warnings(job: dict[str, Any]) -> list[str]:
     """Delivery / fire warning lines for one job in ``cron list``."""
     lines = []
@@ -293,6 +310,8 @@ def _job_warnings(job: dict[str, Any]) -> list[str]:
     if unverified := job.get("last_delivery_unverified"):
         lines.append(f"{color('⚠ Delivery UNVERIFIED:', Colors.YELLOW)} adapter acked "
                      f"{_unverified_targets(unverified)} without message_id/raw_response")
+    if line := _delivery_turn_warning(job):
+        lines.append(color(f"⚠ {line}", Colors.YELLOW))
     fire_err = job.get("last_fire_error")
     if isinstance(fire_err, dict) and fire_err.get("detail"):
         lines.append(color(f"⚠ {_missed_fire_issue(job, fire_err)}", Colors.RED))
