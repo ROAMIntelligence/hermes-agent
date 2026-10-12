@@ -364,6 +364,27 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
+def _gateway_rebooted_since(started_at) -> bool:
+    """True when ``started_at`` is an epoch-stamped worker fingerprint
+    (``"<instantiation epoch>|<start time>"``, see ``_process_fingerprint``) whose epoch differs
+    from the CURRENT gateway's ``current_instantiation_epoch()`` — i.e. the whole gateway process
+    (container recycle, s6/systemd respawn) rebooted since this worker was spawned, independent of
+    whatever killed the worker's own PID. Any other shape (``None``, legacy bare int, the
+    UNVERIFIED marker) returns False: only a positively-confirmed reboot counts, so an unreadable
+    fingerprint fails closed into the ordinary crash path rather than silently waiving a failure.
+    """
+    if not isinstance(started_at, str) or "|" not in started_at:
+        return False
+    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+        return False
+    spawn_epoch = started_at.split("|", 1)[0]
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+        return current_instantiation_epoch() != spawn_epoch
+    except Exception:
+        return False
+
+
 def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
@@ -925,6 +946,16 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# An infrastructure interruption (gateway/container recycle) never counts against
+# ``consecutive_failures`` by itself -- the worker's death proves nothing about the
+# task. Left completely uncapped, though, a task that itself provokes the recycle
+# (or just keeps losing the race against one) would requeue forever with the
+# breaker never looking at it. This bounds that exemption with a trailing STREAK
+# (``_infrastructure_streak``), independent of ``consecutive_failures`` and of the
+# protocol-violation budget above: past the cap, the next infra-classified death
+# trips for real so an operator sees it, same shape as the systemic-crash carve-out.
+_INFRASTRUCTURE_INTERRUPT_LIMIT = 8
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -951,6 +982,32 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
         ):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _infrastructure_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of gateway-recycle interruptions.
+
+    Walks closed runs newest-first (including the one ``detect_crashed_workers``
+    just closed, which ``_reclaim_dead_workers`` already stamped with the
+    ``infrastructure`` run-metadata marker via ``dead.event_payload``). Any other
+    closed run -- a success, a different crash reason, a rate limit -- breaks the
+    streak, so the bounded budget counts ONLY consecutive recycle kills: a task
+    that also fails for its own reasons in between still spends its ordinary
+    ``consecutive_failures`` budget as usual.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        if row["outcome"] == "crashed" and _kb._json_dict(row["metadata"]).get("infrastructure"):
             streak += 1
             continue
         break
@@ -1027,6 +1084,16 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    infrastructure: bool = False
+    """``_gateway_rebooted_since`` matched: the whole gateway process (container recycle,
+    not this task) died and restarted between spawn and reclaim, so the worker's own death
+    proves nothing about the task. ``_account_crashes`` books it via
+    ``_record_task_failure(infrastructure=True)`` — the run is still recorded ``crashed``,
+    but ``consecutive_failures`` is left untouched so a single recycle never trips the breaker
+    (2026-10-12 incident: a single recycle blocked every in-flight card on the fleet). Bounded:
+    past ``_INFRASTRUCTURE_INTERRUPT_LIMIT`` consecutive recycle hits on the SAME task
+    (``_infrastructure_streak``), ``_account_crashes`` trips for real instead of exempting it
+    forever."""
 
     @property
     def run_outcome(self) -> str:
@@ -1036,7 +1103,12 @@ class _DeadWorker:
 
 
 def _classify_dead_worker(
-    pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    pid: int,
+    claimer: Optional[str],
+    *,
+    task_id: Optional[str] = None,
+    board: Optional[str] = None,
+    started_at=None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1044,8 +1116,8 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
-    if task_id and not dead.rate_limited:
+    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board, started_at=started_at)
+    if task_id and not dead.rate_limited and not dead.infrastructure:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
@@ -1059,6 +1131,7 @@ def _classify_dead_worker_exit(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    started_at=None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
@@ -1066,7 +1139,12 @@ def _classify_dead_worker_exit(
     reads the exit trailer the worker left in its log instead, so the same death
     gets the same booking (protocol violation / rate-limit requeue / crash) as
     under the gateway-embedded dispatcher. A worker that never reached its exit
-    epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+    epilogue (killed, OOM) leaves no trailer and stays a plain crash — UNLESS
+    ``started_at`` (the fingerprint recorded at spawn) proves the whole gateway
+    rebooted since, in which case it is an infrastructure interruption, not a crash
+    (``_gateway_rebooted_since``; a fresh gateway process also has an empty reap
+    registry, so this is the common shape for a recycle-killed worker: ``kind``
+    stays ``"unknown"`` all the way through).
     """
     kind, code = _classify_worker_exit(pid)
     if kind == "unknown" and task_id:
@@ -1112,6 +1190,15 @@ def _classify_dead_worker_exit(
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
     else:
+        if started_at is not None and _gateway_rebooted_since(started_at):
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} not alive — the gateway restarted since this worker was spawned "
+                "(container recycle): interrupted by infrastructure, not counted as a failure",
+                "crashed",
+                {"pid": pid, "claimer": claimer, "infrastructure": True},
+                infrastructure=True,
+            )
         error_text = f"pid {pid} not alive"
     event_payload = {"pid": pid, "claimer": claimer}
     if code is not None and kind != "unknown":
@@ -1157,7 +1244,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"], task_id=row["id"], board=board,
+                started_at=_kb._row_get(row, "worker_started_at"),
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1211,7 +1301,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
-    heal them) trip immediately.
+    heal them) trip immediately. Gateway-recycle interruptions get their own
+    BOUNDED streak-only budget too (``_INFRASTRUCTURE_INTERRUPT_LIMIT``,
+    ``_infrastructure_streak``): a single recycle never counts, but a task
+    stuck losing that race repeatedly trips for real past the cap instead of
+    requeuing forever unexamined.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -1264,6 +1358,45 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
+        elif dead.infrastructure:
+            # The gateway itself rebooted (container recycle) between spawn and reclaim — the
+            # worker's death proves nothing about the task, so a single recycle leaves
+            # ``consecutive_failures`` alone (``infrastructure=True``) and the breaker can never
+            # trip on it, no matter how many in-flight cards one recycle killed in the same tick.
+            # Bounded, though (``_INFRASTRUCTURE_INTERRUPT_LIMIT``): a task that keeps getting hit
+            # by recycles back-to-back -- or itself provokes them -- must not requeue forever
+            # unexamined, so past the trailing streak cap this trips for real, same shape as the
+            # other force-trip carve-outs, with the cause stamped for the operator.
+            streak = _infrastructure_streak(conn, tid)
+            if streak >= _INFRASTRUCTURE_INTERRUPT_LIMIT:
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid, "claimer": claimer,
+                        "infrastructure": True,
+                        "infrastructure_streak": streak,
+                        "infrastructure_limit_exceeded": True,
+                    },
+                )
+            else:
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    release_claim=False,
+                    end_run=False,
+                    infrastructure=True,
+                    event_payload_extra={
+                        "pid": pid, "claimer": claimer,
+                        "infrastructure": True,
+                        "infrastructure_streak": streak,
+                    },
+                )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
