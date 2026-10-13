@@ -646,6 +646,13 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
     )
     captured: list[list[str]] = []
+    # The pin must resolve in the reviewer's profile or the dispatcher blocks the card at claim.
+    skill_dir = kanban_home / "profiles" / "reviewer" / "skills" / "domain-specific-review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: domain-specific-review\ndescription: Use when reviewing a domain.\n---\n\n# Review\n",
+        encoding="utf-8",
+    )
 
     def spawn(task, workspace):
         captured.append(list(task.skills or []))

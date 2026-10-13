@@ -26,6 +26,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_dispatch_skillpins import block_unresolvable_skill_pins as _block_unresolvable_skill_pins
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -130,6 +131,10 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    blocked_bad_skill_pin: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, unresolved_skill_names)`` claimed but never spawned: the card's
+    ``skills`` pin names a skill the assignee profile cannot load. Parked ``blocked``
+    (``needs_input``) without spending the failure budget."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2095,6 +2100,8 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        return False
+    if _block_unresolvable_skill_pins(conn, claimed, result):
         return False
     try:
         resolved_branch_name = None
