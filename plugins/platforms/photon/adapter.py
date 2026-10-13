@@ -952,6 +952,70 @@ class PhotonAdapter(BasePlatformAdapter):
             return False
         return True
 
+    @staticmethod
+    def _proc_environ_keys(pid: int) -> Optional[set]:
+        """Env var NAMES of ``pid`` (Linux /proc), or None if unreadable. Names only."""
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            return None
+        return {chunk.split(b"=", 1)[0].decode("utf-8", "replace") for chunk in raw.split(b"\0") if chunk}
+
+    @classmethod
+    def _find_orphan_sidecar_pids(cls) -> List[int]:
+        """Same-uid sidecars whose parent is gone (``ppid == 1``), on ANY port.
+
+        ``_reap_stale_sidecar`` only reaches a sidecar squatting OUR port; an orphan on
+        another port (leaked by a killed gateway or test run) keeps its bearer env alive
+        forever. A match needs ppid 1 AND a sidecar identity: the absolute
+        ``photon/sidecar/index.mjs`` command line (as in ``_pid_is_sidecar``), or the
+        relative ``node index.mjs`` form corroborated by PHOTON_SIDECAR_TOKEN +
+        PHOTON_SIDECAR_PORT in its environ. Never the command name alone.
+        """
+        out = cls._quick_stdout(["ps", "-u", str(os.geteuid()), "-o", "pid=,ppid=,command="])
+        if not out:
+            return []
+        found: List[int] = []
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3 or not (parts[0].isdigit() and parts[1].isdigit()):
+                continue
+            pid, ppid, cmd = int(parts[0]), int(parts[1]), parts[2]
+            if ppid != 1 or pid == os.getpid():
+                continue
+            toks = cmd.split()
+            if not toks or not os.path.basename(toks[0]).startswith("node"):
+                continue
+            if any(t.endswith("photon/sidecar/index.mjs") for t in toks[1:]):
+                found.append(pid)
+            elif toks[-1] == "index.mjs":
+                keys = cls._proc_environ_keys(pid)
+                if keys is not None and {"PHOTON_SIDECAR_TOKEN", "PHOTON_SIDECAR_PORT"} <= keys:
+                    found.append(pid)
+        return found
+
+    async def _reap_orphan_sidecars(self) -> None:
+        """Kill sidecars orphaned to init on any port (see ``_find_orphan_sidecar_pids``)."""
+        # A pid-1 gateway is every sidecar's legitimate parent: ppid == 1 proves nothing.
+        if sys.platform == "win32" or os.getpid() == 1:
+            return
+        orphans = await asyncio.to_thread(self._find_orphan_sidecar_pids)
+        if not orphans:
+            return
+
+        def _kill(pid: int, sig: int) -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, sig)  # windows-footgun: ok — unreachable on win32 (early return above)
+        for pid in orphans:
+            logger.warning("[photon] reaping orphaned sidecar (pid %d, parent gone)", pid)
+            _kill(pid, signal.SIGTERM)
+        deadline = time.time() + 3.0
+        while time.time() < deadline and any(self._pid_alive(p) for p in orphans):
+            await asyncio.sleep(0.1)
+        for pid in orphans:
+            if self._pid_alive(pid):
+                _kill(pid, signal.SIGKILL)  # windows-footgun: ok — unreachable on win32 (early return above)
+
     async def _reap_stale_sidecar(self) -> None:
         """Kill an orphaned sidecar squatting our port (a SIGKILLed gateway leaves one whose
         token we don't know, so every respawn dies on EADDRINUSE). Listeners are verified
@@ -1038,6 +1102,7 @@ class PhotonAdapter(BasePlatformAdapter):
             except pm.InstallError as exc:
                 raise PhotonSidecarStartupError(str(exc), code="SIDECAR_NODE_MISSING", retryable=False) from exc
         await self._ensure_sidecar_deps()
+        await self._reap_orphan_sidecars()
         await self._reap_stale_sidecar()
         env = with_hermes_node_path()
         env.update({

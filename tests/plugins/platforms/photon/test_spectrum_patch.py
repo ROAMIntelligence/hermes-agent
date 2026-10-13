@@ -23,6 +23,10 @@ def _sidecar_env(port: int) -> dict[str, str]:
         "PHOTON_PROJECT_SECRET": "test-secret",
         "PHOTON_SIDECAR_PORT": str(port),
         "PHOTON_SIDECAR_TOKEN": "test-token",
+        # Exit on stdin EOF, as the adapter spawns it: if pytest itself dies (timeout, SIGKILL)
+        # before the `finally` below runs, the closed pipe still takes the sidecar down
+        # instead of orphaning a node process holding this env.
+        "PHOTON_SIDECAR_WATCH_STDIN": "1",
     }
 
 
@@ -98,6 +102,7 @@ def test_sidecar_patch_failure_still_reaches_health_endpoint(tmp_path: Path) -> 
         ["node", "index.mjs"],
         cwd=sidecar,
         env=_sidecar_env(port),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -123,8 +128,14 @@ def test_sidecar_patch_failure_still_reaches_health_endpoint(tmp_path: Path) -> 
         assert payload["ok"] is True
         assert proc.poll() is None
     finally:
+        # Reap on the failure path too: terminate, then escalate if it ignores SIGTERM, so a
+        # failed assertion/timeout above can never leak a live sidecar.
         proc.terminate()
-        _, stderr = proc.communicate(timeout=5)
+        try:
+            _, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr = proc.communicate()
 
     assert "forced patch failure" in stderr
 
