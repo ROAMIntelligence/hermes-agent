@@ -1374,6 +1374,17 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # A card that already reached a terminal lifecycle state must not
+        # accumulate failure records. A late non-success signal can arrive
+        # *after* ``complete_task`` — the agent finalizer fires on iteration-
+        # budget exhaustion even when the worker already called
+        # ``kanban_complete`` — which would otherwise stamp ``consecutive_failures``
+        # and append a trailing ``timed_out`` whose last word about a verified
+        # ``done`` card is "task could not complete" (and, via ``retry_status:
+        # "ready"``, advertise a re-dispatch of finished work). The completion is
+        # the terminal record; here the failure path is a strict no-op.
+        if row["status"] in ("done", "archived"):
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1405,6 +1416,10 @@ def _record_task_failure(
                     (failures, error, task_id),
                 )
             # Timeout/crash path's caller already emitted its own event.
+            # Any other path appends the outcome event ONLY when it actually
+            # closed an open run: an already-closed run (``_end_run`` -> None,
+            # e.g. a completion landed first) must not leave a trailing failure
+            # event contradicting the terminal record.
             if end_run:
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
@@ -1412,7 +1427,8 @@ def _record_task_failure(
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
+                if run_id is not None:
+                    _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
