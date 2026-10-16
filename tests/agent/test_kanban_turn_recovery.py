@@ -725,3 +725,391 @@ def test_goal_mode_continues_after_a_successful_authorized_recovery(
     assert _drive(cli_mod, driver) == 0
     assert len(entered) == 2
     assert goal_spy == [("done", driver)]
+
+
+# ── guardrail stop on a non-lifecycle tool (run 2648 class) ──────────
+#
+# A tool-loop guardrail block/stop on ANY tool (not just the five lifecycle
+# tools PR #182 covers) used to end a worker run with the interactive canned
+# reply and no terminal kanban call: the turn had no failure verdict for
+# ``guardrail_halt``, read as completed, and the worker exited rc=0 -> booked
+# ``protocol_violation``/``crashed`` with the card still ``running``. These
+# tests pin the fix: the seam stamps the stop as a retryable failed turn ONLY
+# for a worker, and the bounded in-place recovery drives it to a real terminal
+# call. Every fixture is synthetic: dummy paths/text only, no live-tree
+# content, no transcript payloads, nothing from /opt/data/briefs.
+
+import inspect  # noqa: E402  (section-local imports; kept together for the audit)
+
+#: Dummy read result and call arguments for the synthesized block. The SHAPE of
+#: run 2648 (same read-only call answered identically five times) with fake values.
+_DUMMY_READ_RESULT = "[fixture] notes line one" + chr(10) + "[fixture] notes line two"
+_FIXTURE_READ_ARGS = {"path": "/tmp/fixture-scratch/notes.txt"}
+
+#: Canned interactive-reply SHAPE (an offer of ``continue`` + redirect), written for this
+#: fixture - deliberately NOT the live text.
+_CANNED_HALT_REPLY = (
+    "[fixture] the tool loop stopped because identical results kept repeating. "
+    "Send `continue` to retry from here, or redirect me."
+)
+
+
+def _blocked_read_decision():
+    """Drive the REAL guard controller the way the recorded stop happened: the same
+    read-only call answered with the same result five times, then blocked on the sixth
+    (the hard-stop promotion for non-interactive platforms is already on it)."""
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+    guard = ToolCallGuardrailController(
+        ToolCallGuardrailConfig.from_mapping({}, platform="kanban")
+    )
+    for _ in range(5):
+        guard.before_call("read_file", dict(_FIXTURE_READ_ARGS))
+        guard.after_call("read_file", dict(_FIXTURE_READ_ARGS), _DUMMY_READ_RESULT, failed=False)
+    decision = guard.before_call("read_file", dict(_FIXTURE_READ_ARGS))
+    assert decision.code == "idempotent_no_progress_block"
+    assert decision.count == 5
+    assert decision.should_halt is True
+    return decision
+
+
+def _stopped_turn_result(decision, *, interrupted: bool = False) -> dict:
+    """The settled turn result a guardrail stop produces on the fixed tree, synthesized
+    to the recorded shape (canned reply, ``turn_exit_reason``, guardrail decision
+    metadata) and stamped through the REAL seam verdict exactly the way
+    ``agent/turn_finalizer.py`` consumes it: ``fails_turn`` -> ``failed=True``, then the
+    ``completed=`` recompute (which follows the seam) reads False, and the assembly
+    stamps the verdict fields. On a non-worker (or interrupted) path the verdict is
+    None and the result keeps today's values field-for-field."""
+    from agent.turn_failure_copy import stamp_failure, worker_guardrail_halt_failure
+
+    result = {
+        "failed": False,
+        "completed": True,
+        "final_response": _CANNED_HALT_REPLY,
+        "error": "",
+        "turn_exit_reason": "guardrail_halt",
+        "guardrail": decision.to_metadata(),
+        "messages": [],
+    }
+    verdict = worker_guardrail_halt_failure("guardrail_halt", interrupted=interrupted)
+    if verdict is not None and verdict.fails_turn:
+        result["failed"] = True
+        result["completed"] = False
+        result["error"] = result["final_response"]
+        stamp_failure(result, verdict.reason, verdict.retryable)
+    return result
+
+
+def _live_board(clear_kanban_env, root, monkeypatch):
+    """A REAL kanban board (full schema via ``kb.init_db``) with one claimed run, pinned
+    as this worker's carrier: task id + run id + claim lock from the actual rows."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = root / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: root)
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="guardrail-stop replay fixture")
+        claimed = kb.claim_task(conn, task_id, claimer="replay", ttl_seconds=3600)
+        assert claimed is not None
+    db_path = kb.kanban_db_path()
+    with kbc.connect() as conn:
+        trow = conn.execute(
+            "SELECT claim_lock, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    assert trow["current_run_id"] is not None
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", task_id)
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db_path))
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(int(trow["current_run_id"])))
+    clear_kanban_env.setenv("HERMES_KANBAN_CLAIM_LOCK", str(trow["claim_lock"]))
+    return SimpleNamespace(
+        kb=kb, kbc=kbc, root=root, task_id=task_id,
+        run_id=int(trow["current_run_id"]), lock=str(trow["claim_lock"]),
+    )
+
+
+def _read_board_state(board):
+    with board.kbc.connect() as conn:
+        trow = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (board.task_id,)
+        ).fetchone()
+        runs = conn.execute(
+            "SELECT id, outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id",
+            (board.task_id,),
+        ).fetchall()
+        ev = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (board.task_id,),
+        ).fetchone()
+    return {
+        "task_status": trow["status"],
+        "runs": [(int(r["id"]), r["outcome"], r["metadata"]) for r in runs],
+        "last_event": ev["kind"] if ev else None,
+    }
+
+
+def _board_script(board, *, terminal, stopped):
+    """The cooperating stub on the model seam: turn 1 is the stopped turn (or a clean
+    success); on the recovery entry it performs the REAL terminal board call - exactly
+    what the kanban_complete / kanban_block tool handlers do, ownership CAS included -
+    and then settles successfully."""
+    state = {"n": 0, "terminal_ok": None}
+    decision = _blocked_read_decision() if stopped else None
+
+    def script():
+        state["n"] += 1
+        if state["n"] == 1 and stopped:
+            return _stopped_turn_result(decision)
+        with board.kbc.connect() as conn:
+            if terminal == "complete":
+                state["terminal_ok"] = board.kb.complete_task(
+                    conn, board.task_id,
+                    summary="recovered in place after a tool-loop guardrail stop",
+                    expected_run_id=board.run_id,
+                )
+            else:
+                state["terminal_ok"] = board.kb.block_task(
+                    conn, board.task_id,
+                    reason="guardrail stop blocked a repeated call; needs a decision",
+                    expected_run_id=board.run_id,
+                )
+        return _success()
+
+    script.state = state
+    return script
+
+
+def _drive_board_case(clear_kanban_env, root, monkeypatch, cli_harness, driver, *,
+                      terminal, stopped, recovery=None):
+    board = _live_board(clear_kanban_env, root, monkeypatch)
+    if recovery is not None:
+        clear_kanban_env.setenv("HERMES_KANBAN_TURN_RECOVERY", str(recovery))
+    script = _board_script(board, terminal=terminal, stopped=stopped)
+    cli_mod, entered, _ui = cli_harness(driver, script)
+    code = _drive(cli_mod, driver)
+    return SimpleNamespace(
+        board=board, code=code, entered=entered, script=script,
+        state=_read_board_state(board),
+    )
+
+
+def test_guardrail_seam_values(clear_kanban_env):
+    """The exact verdict the finalizer seam lands, value-for-value: retryable on purpose
+    (in-place retry authority), and ONLY for the stripped worker predicate - the shared
+    exit-reason map is untouched, so every other surface keeps today's values."""
+    from agent.turn_failure_copy import (
+        ExitFailure,
+        exit_reason_failure,
+        worker_guardrail_halt_failure,
+    )
+
+    assert exit_reason_failure("guardrail_halt") is None  # nothing added to the shared map
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    verdict = worker_guardrail_halt_failure("guardrail_halt")
+    assert verdict == ExitFailure(reason="guardrail_halt", retryable=True, fails_turn=True)
+    stamped = _stopped_turn_result(_blocked_read_decision())
+    assert stamped["failed"] is True
+    assert stamped["completed"] is False  # a stop never reads as a completed turn
+    assert stamped["failure_reason"] == "guardrail_halt"
+    assert stamped["failure_retryable"] is True
+    assert should_recover_turn(stamped, attempt=0) is True  # -> in-place retry authority
+    assert should_recover_turn({**stamped, "interrupted": True}, attempt=0) is False
+
+    clear_kanban_env.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert worker_guardrail_halt_failure("guardrail_halt") is None
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "   ")
+    assert worker_guardrail_halt_failure("guardrail_halt") is None  # blank is not a worker
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    assert worker_guardrail_halt_failure("timeout") is None
+    assert worker_guardrail_halt_failure(None) is None
+
+
+def test_guardrail_seam_is_wired_into_the_finalizer():
+    """If the seam call is ever dropped, the stop silently reads as completed again."""
+    from agent.turn_finalizer import finalize_turn
+
+    src = inspect.getsource(finalize_turn)
+    assert "worker_guardrail_halt_failure(_turn_exit_reason, interrupted=interrupted)" in src
+
+
+def test_guardrail_nudge_allowlist_and_leak_check(clear_kanban_env):
+    """The nudge may interpolate ONLY tool name / decision code / count. Every other
+    guardrail field (message, signature/args hash, path) must NOT cross over, and
+    hostile values degrade to the fixed literals instead of echoing."""
+    import agent.kanban_turn_recovery as rec
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    nudge = rec._guardrail_halt_nudge(
+        {"guardrail": {
+            "tool_name": "read_file", "code": "idempotent_no_progress_block", "count": 5,
+            "message": "LEAKCANARY-MESSAGE", "signature": {"args_hash": "LEAKCANARY-HASH"},
+            "path": "LEAKCANARY-PATH",
+        }},
+        attempt=2, max_attempts=3, task_id="t_probe",
+    )
+    assert "LEAKCANARY" not in nudge
+    assert "read_file" in nudge and "idempotent_no_progress_block" in nudge
+    assert "count=5" in nudge and "2/3" in nudge
+    assert "STOPPED by a tool-loop guardrail" in nudge
+    assert "Do NOT start over" in nudge
+    assert "API call failed" not in nudge  # never the provider-failure narration
+    start = nudge.index("reason: '") + len("reason: '")
+    end = nudge.index("').]", start)
+    suggested_line = nudge[start:end]
+    assert suggested_line and len(suggested_line) <= 300 and chr(10) not in suggested_line
+
+    hostile = rec._guardrail_halt_nudge(
+        {"guardrail": {"tool_name": "read_file; hostile-payload", "code": "not_a_real_code",
+                       "count": "many"}},
+        attempt=1, max_attempts=3, task_id="t_probe",
+    )
+    assert "hostile-payload" not in hostile and "not_a_real_code" not in hostile
+    assert "count=" not in hostile  # non-int count is dropped, not stringified
+    assert "Tool `tool` was blocked" in hostile  # literal fallback
+
+
+def test_build_recovery_nudge_routes_the_guardrail_variant(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    guardrail = build_recovery_nudge(
+        _stopped_turn_result(_blocked_read_decision()), attempt=1, max_attempts=3
+    )
+    assert "STOPPED by a tool-loop guardrail" in guardrail
+    assert "Do NOT start over" in guardrail
+    assert "kanban_complete" in guardrail and "kanban_block" in guardrail
+
+    provider = build_recovery_nudge(_failed(), attempt=1, max_attempts=3)
+    assert "peer closed connection" in provider
+    assert "STOPPED by a tool-loop guardrail" not in provider
+
+    reason_only = build_recovery_nudge(
+        {"failed": True, "failure_retryable": True, "failure_reason": "guardrail_halt"},
+        attempt=1, max_attempts=3,
+    )
+    assert "STOPPED by a tool-loop guardrail" in reason_only
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+@pytest.mark.parametrize(
+    ("terminal", "expected_status"),
+    [("complete", "done"), ("block", "blocked")],
+)
+def test_guardrail_replay_reaches_a_terminal_call(
+    driver, terminal, expected_status, clear_kanban_env, tmp_path, monkeypatch,
+    cli_harness, live_claim,
+):
+    """AC1 forced replay, value-level. Clean-path recording FIRST: the same terminal call
+    with no stop anywhere is the expected (status, outcome, event) - then the stopped
+    replay must EQUAL it, not merely differ from 'crashed'. The run id survives, no run
+    row is added, and the run metadata carries no protocol_violation key."""
+    import agent.kanban_turn_recovery as rec
+
+    monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
+
+    clean = _drive_board_case(
+        clear_kanban_env, tmp_path / "clean", monkeypatch, cli_harness, driver,
+        terminal=terminal, stopped=False,
+    )
+    assert clean.code == 0
+    assert len(clean.entered) == 1
+    assert clean.state["task_status"] == expected_status
+    assert clean.state["last_event"] in ("completed", "blocked")
+    assert clean.state["runs"][0][1] is not None  # the clean outcome, recorded first
+
+    stopped = _drive_board_case(
+        clear_kanban_env, tmp_path / "stopped", monkeypatch, cli_harness, driver,
+        terminal=terminal, stopped=True,
+    )
+    assert stopped.code == 0  # terminal call made; the stop did not strand the run
+    assert len(stopped.entered) == 2  # the stopped turn, then the recovery turn
+    nudge = stopped.entered[1]
+    assert "STOPPED by a tool-loop guardrail" in nudge
+    assert "read_file" in nudge and "idempotent_no_progress_block" in nudge
+    assert "count=5" in nudge
+    assert "Do NOT start over" in nudge
+    assert "kanban_complete" in nudge and "kanban_block" in nudge
+    assert "API call failed" not in nudge
+    assert stopped.script.state["terminal_ok"] is True
+
+    # equality with the clean path, value-for-value
+    assert stopped.state["task_status"] == clean.state["task_status"]
+    assert stopped.state["runs"][0][1] == clean.state["runs"][0][1]  # run outcome EQUALS
+    assert stopped.state["last_event"] == clean.state["last_event"]  # terminal call
+    # run-id unchanged across stop -> recover, zero extra task_runs rows
+    assert len(stopped.state["runs"]) == 1 and len(clean.state["runs"]) == 1
+    assert stopped.state["runs"][0][0] == stopped.board.run_id
+    # no protocol_violation marker in the run metadata
+    assert "protocol_violation" not in (stopped.state["runs"][0][2] or "")
+    assert "protocol_violation" not in (clean.state["runs"][0][2] or "")
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_guardrail_budget_exhaustion_and_repeat_exit_nonzero(
+    driver, clear_kanban_env, monkeypatch, cli_harness, live_claim,
+):
+    """AC2: a stub that re-stops on every recovery turn (never terminal) consumes the
+    pinned budget monotonically (1 -> 2 -> 3, never more) and then the process exits as a
+    REAL failure: rc=1 -> nonzero_exit, never the clean_exit class that books
+    protocol_violation."""
+    import agent.kanban_turn_recovery as rec
+    from hermes_cli.kanban_db_dispatch import _exit_code_kind
+
+    _worker_env(monkeypatch)
+    monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
+    assert rec.max_recovery_attempts() == rec.DEFAULT_MAX_RECOVERY_ATTEMPTS == 3
+
+    ladder: list = []
+    real_delay = rec.recovery_delay_seconds
+    monkeypatch.setattr(
+        rec, "recovery_delay_seconds", lambda a: (ladder.append(a), real_delay(a))[1]
+    )
+
+    def restop():
+        return _stopped_turn_result(_blocked_read_decision())
+
+    cli_mod, entered, _ui = cli_harness(driver, restop)
+    code = _drive(cli_mod, driver)
+
+    assert code == 1
+    assert _exit_code_kind(code) == ("nonzero_exit", 1)
+    assert len(entered) == 1 + rec.DEFAULT_MAX_RECOVERY_ATTEMPTS  # 1 stop + 3 re-entries
+    assert ladder == [1, 2, 3]  # monotone consumption, capped at the budget
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_guardrail_negative_controls(
+    driver, clear_kanban_env, monkeypatch, cli_harness,
+):
+    """AC3 field-level negative controls: a NON-worker stopped turn keeps every observable
+    value it has today (failed False, no stamp, turn_exit_reason intact, rc=0
+    clean_exit - cron silence / gateway transcript rows key on exactly these);
+    interrupted wins over the seam; a normal completed worker turn takes no extra
+    retries."""
+    from agent.turn_failure_copy import worker_guardrail_halt_failure
+    from cli import _single_query_exit_code
+    from hermes_cli.kanban_db_dispatch import _exit_code_kind
+
+    # (a) interrupted wins, even on a worker
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    assert worker_guardrail_halt_failure("guardrail_halt", interrupted=True) is None
+
+    # (b) non-worker: the seam leaves the result exactly as today
+    clear_kanban_env.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = _stopped_turn_result(_blocked_read_decision())
+    assert result["failed"] is False and "failure_reason" not in result
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert _single_query_exit_code(result) == 0
+    assert _exit_code_kind(0) == ("clean_exit", 0)
+    cli_mod, entered, _ui = cli_harness(driver, [result])
+    assert _drive(cli_mod, driver) == 0
+    assert len(entered) == 1  # no recovery attempt on a non-worker stop
+
+    # (c) a normal completed worker turn: same single turn, same exit
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    cli_mod, entered, _ui = cli_harness(driver, [_success()])
+    assert _drive(cli_mod, driver) == 0
+    assert len(entered) == 1

@@ -15,7 +15,11 @@ from typing import Any, Callable, List, Optional, Tuple
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.interrupt_control import interrupted_during_api_call_reason
-from agent.turn_failure_copy import exit_reason_failure, stamp_failure
+from agent.turn_failure_copy import (
+    exit_reason_failure,
+    stamp_failure,
+    worker_guardrail_halt_failure,
+)
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
@@ -580,6 +584,11 @@ def finalize_turn(
     # Advisory verdicts (``fails_turn=False``) only add the code: ``failed``/``completed`` keep
     # the loop's values so cron, kanban and transcript persistence behave as before.
     _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
+    if _exit_failure is None:
+        # A tool-guardrail halt on ANY tool must never read as a completed turn on
+        # an unattended lane: worker-gated so every non-worker surface keeps today
+        # field-for-field (see worker_guardrail_halt_failure's docstring).
+        _exit_failure = worker_guardrail_halt_failure(_turn_exit_reason, interrupted=interrupted)
     if _exit_failure is not None and _exit_failure.fails_turn:
         failed = True
 

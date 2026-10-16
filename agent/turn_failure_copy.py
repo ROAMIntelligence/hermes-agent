@@ -143,6 +143,35 @@ def exit_reason_failure(turn_exit_reason: Any) -> Optional[ExitFailure]:
     return None
 
 
+def worker_guardrail_halt_failure(
+    turn_exit_reason: Any, *, interrupted: bool = False,
+) -> Optional[ExitFailure]:
+    """Worker-gated failure verdict for a tool-loop guardrail halt.
+
+    A guardrail stop (a block/halt on any tool) ends the turn with the interactive
+    canned reply, and the exit-reason map has no entry for it: the turn read as
+    COMPLETED, the worker exited ``rc=0`` with no terminal kanban call, and the
+    dispatcher booked the run ``protocol_violation``/``crashed``. This verdict closes
+    that hole at ``agent/turn_finalizer.py``'s seam and only for a worker run: the
+    predicate is :func:`agent.kanban_turn_recovery.kanban_task_id` - the same
+    stripped ``HERMES_KANBAN_TASK`` every other kanban-worker gate uses - so
+    non-worker surfaces (cron, desktop, gateway, tool subprocesses) keep today's
+    values field-for-field, and ``interrupted`` still wins. Retryable is deliberate:
+    the dispatcher grants in-place retry authority only to a FAILED turn whose
+    classifier marked it ``retryable``, so the halt becomes one bounded in-process
+    recovery (context preserved) instead of a cold respawn that re-reads everything.
+    """
+    if interrupted:
+        return None
+    if str(turn_exit_reason or "") != "guardrail_halt":
+        return None
+    from agent.kanban_turn_recovery import kanban_task_id
+
+    if kanban_task_id() is None:
+        return None
+    return ExitFailure(reason="guardrail_halt", retryable=True, fails_turn=True)
+
+
 def is_max_iteration_handoff(result: Any) -> bool:
     """A non-failed, non-interrupted ``max_iterations_reached(N/N)`` result that still carries a
     summary. ``completed`` is False because the work did not finish in that turn, but the turn

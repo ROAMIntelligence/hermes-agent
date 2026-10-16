@@ -272,6 +272,50 @@ def _truncate(text: str, limit: int = 300) -> str:
     return text[: limit - 1] + "…" if len(text) > limit else text
 
 
+def _guardrail_halt_nudge(result: dict, *, attempt: int, max_attempts: int, task_id: str) -> str:
+    """The recovery nudge for a turn stopped by a tool-loop guardrail.
+
+    Interpolates ONLY allowlisted fields: the blocked tool name (validated
+    ``^[a-z_]{1,64}$``, else literally ``tool``), the guard's decision code (a key
+    of the guard's closed ``_DECISION_MESSAGES`` set, else omitted) and its integer
+    count. The guard's message, the call's arguments, file content and result text
+    never cross into the nudge - truncation is not sanitization.
+    """
+    guardrail = result.get("guardrail")
+    guardrail = guardrail if isinstance(guardrail, dict) else {}
+    tool = str(guardrail.get("tool_name") or "")
+    if not (1 <= len(tool) <= 64 and all(c in "abcdefghijklmnopqrstuvwxyz_" for c in tool)):
+        tool = "tool"
+    code = str(guardrail.get("code") or "")
+    try:
+        from agent.tool_guardrails import _DECISION_MESSAGES  # the guard's closed code set
+        code = code if code in _DECISION_MESSAGES else ""
+    except Exception:
+        code = ""
+    count = guardrail.get("count")
+    count = count if isinstance(count, int) and not isinstance(count, bool) else None
+    detail = f" ({code}, count={count})" if code and count is not None else (f" ({code})" if code else "")
+    suggested = _truncate(
+        f"guardrail halt: repeated {tool} call blocked{detail}; "
+        "the card needs a decision before it can proceed"
+    )
+    return (
+        "[System: the previous turn was STOPPED by a tool-loop guardrail after "
+        "repeated identical results - this is NOT a provider failure (recovery attempt "
+        f"{attempt}/{max_attempts}). Tool `{tool}` was blocked{detail}; repeating that "
+        "call unchanged will be denied again.\n\n"
+        f"Task `{task_id}` is still `running`. This is the SAME session, with your full "
+        "context - nothing you already read, wrote, or computed is lost. Do NOT start over.\n\n"
+        "Do this immediately:\n"
+        f"1. Do NOT repeat the blocked `{tool}` call unchanged; use the result already "
+        "in this session, or continue from what you have.\n"
+        "2. Finish the remaining deliverable from the context you already have.\n"
+        "3. End with a terminal `kanban_complete(summary=..., artifacts=[...])` if the "
+        "work is done, or `kanban_block(reason=...)` if you are blocked (suggested one-line "
+        f"reason: {suggested!r}).]"
+    )
+
+
 def build_recovery_nudge(result: Any, *, attempt: int, max_attempts: int) -> str:
     """The synthetic user turn sent after a failed worker turn.
 
@@ -279,11 +323,20 @@ def build_recovery_nudge(result: Any, *, attempt: int, max_attempts: int) -> str
     terminal state; the worker must finish with ``kanban_complete`` /
     ``kanban_block``. Emphasises "same session, do not start over" so the model
     reuses everything it already read/wrote instead of re-doing the work.
+    A turn stopped by a tool-loop guardrail gets its own variant (see
+    :func:`_guardrail_halt_nudge`).
     """
+    task_id = kanban_task_id() or "this task"
+    if isinstance(result, dict) and (
+        str(result.get("failure_reason") or "") == "guardrail_halt"
+        or str(result.get("turn_exit_reason") or "") == "guardrail_halt"
+    ):
+        return _guardrail_halt_nudge(
+            result, attempt=attempt, max_attempts=max_attempts, task_id=task_id
+        )
     error = ""
     if isinstance(result, dict):
         error = _truncate(str(result.get("error") or result.get("final_response") or ""))
-    task_id = kanban_task_id() or "this task"
     return (
         "[System: the previous turn ended UNFINISHED — the API call failed after "
         f"all retries and the turn was interrupted (recovery attempt {attempt}/{max_attempts}). "
