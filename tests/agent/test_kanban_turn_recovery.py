@@ -737,7 +737,7 @@ def test_goal_mode_continues_after_a_successful_authorized_recovery(
 # tests pin the fix: the seam stamps the stop as a retryable failed turn ONLY
 # for a worker, and the bounded in-place recovery drives it to a real terminal
 # call. Every fixture is synthetic: dummy paths/text only, no live-tree
-# content, no transcript payloads, nothing from /opt/data/briefs.
+# content, no transcript payloads, nothing from the source diagnosis briefs.
 
 import inspect  # noqa: E402  (section-local imports; kept together for the audit)
 
