@@ -289,9 +289,9 @@ def _guardrail_halt_nudge(result: dict, *, attempt: int, max_attempts: int, task
     code = str(guardrail.get("code") or "")
     try:
         from agent.tool_guardrails import _DECISION_MESSAGES  # the guard's closed code set
-        code = code if code in _DECISION_MESSAGES else ""
-    except Exception:
-        code = ""
+    except ImportError:  # guard module absent: omit the code rather than guess
+        _DECISION_MESSAGES = {}
+    code = code if code in _DECISION_MESSAGES else ""
     count = guardrail.get("count")
     count = count if isinstance(count, int) and not isinstance(count, bool) else None
     detail = f" ({code}, count={count})" if code and count is not None else (f" ({code})" if code else "")

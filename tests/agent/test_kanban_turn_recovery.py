@@ -12,6 +12,7 @@ worker predicate this PR adds to it is pinned here.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sqlite3
 from pathlib import Path
@@ -739,8 +740,6 @@ def test_goal_mode_continues_after_a_successful_authorized_recovery(
 # call. Every fixture is synthetic: dummy paths/text only, no live-tree
 # content, no transcript payloads, nothing from the source diagnosis briefs.
 
-import inspect  # noqa: E402  (section-local imports; kept together for the audit)
-
 #: Dummy read result and call arguments for the synthesized block. The SHAPE of
 #: run 2648 (same read-only call answered identically five times) with fake values.
 _DUMMY_READ_RESULT = "[fixture] notes line one" + chr(10) + "[fixture] notes line two"
@@ -931,10 +930,12 @@ def test_guardrail_seam_values(clear_kanban_env):
 
 def test_guardrail_seam_is_wired_into_the_finalizer():
     """If the seam call is ever dropped, the stop silently reads as completed again."""
-    from agent.turn_finalizer import finalize_turn
+    from agent.turn_finalizer import _resolve_turn_exit_failure, finalize_turn
 
     src = inspect.getsource(finalize_turn)
-    assert "worker_guardrail_halt_failure(_turn_exit_reason, interrupted=interrupted)" in src
+    assert "_resolve_turn_exit_failure(_turn_exit_reason, interrupted)" in src
+    helper = inspect.getsource(_resolve_turn_exit_failure)
+    assert "worker_guardrail_halt_failure(turn_exit_reason)" in helper
 
 
 def test_guardrail_nudge_allowlist_and_leak_check(clear_kanban_env):

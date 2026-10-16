@@ -16,6 +16,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.interrupt_control import interrupted_during_api_call_reason
 from agent.turn_failure_copy import (
+    ExitFailure,
     exit_reason_failure,
     stamp_failure,
     worker_guardrail_halt_failure,
@@ -526,6 +527,22 @@ def apply_llm_output_transform(
     return final_response, transformed, pre_transform
 
 
+def _resolve_turn_exit_failure(turn_exit_reason: Any, interrupted: bool) -> Optional[ExitFailure]:
+    """Resolve the turn's :class:`ExitFailure`, worker-gated.
+
+    An interrupted turn yields nothing. Otherwise the standard exit-reason mapping
+    runs first; only when it is silent does the worker-only guardrail-stop verdict
+    apply (``worker_guardrail_halt_failure``), so non-worker surfaces keep today's
+    values field-for-field.
+    """
+    if interrupted:
+        return None
+    failure = exit_reason_failure(turn_exit_reason)
+    if failure is None:
+        failure = worker_guardrail_halt_failure(turn_exit_reason)
+    return failure
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -583,12 +600,7 @@ def finalize_turn(
     # ``turn_exit_reason`` collapsed to code="unknown", retryable=True on every surface.
     # Advisory verdicts (``fails_turn=False``) only add the code: ``failed``/``completed`` keep
     # the loop's values so cron, kanban and transcript persistence behave as before.
-    _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
-    if _exit_failure is None:
-        # A tool-guardrail stop on ANY tool must never read as a completed turn on
-        # an unattended lane: worker-gated so every non-worker surface keeps today
-        # field-for-field (see worker_guardrail_halt_failure's docstring).
-        _exit_failure = worker_guardrail_halt_failure(_turn_exit_reason, interrupted=interrupted)
+    _exit_failure = _resolve_turn_exit_failure(_turn_exit_reason, interrupted)
     if _exit_failure is not None and _exit_failure.fails_turn:
         failed = True
 
