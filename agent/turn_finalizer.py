@@ -585,7 +585,7 @@ def finalize_turn(
     # the loop's values so cron, kanban and transcript persistence behave as before.
     _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
     if _exit_failure is None:
-        # A tool-guardrail halt on ANY tool must never read as a completed turn on
+        # A tool-guardrail stop on ANY tool must never read as a completed turn on
         # an unattended lane: worker-gated so every non-worker surface keeps today
         # field-for-field (see worker_guardrail_halt_failure's docstring).
         _exit_failure = worker_guardrail_halt_failure(_turn_exit_reason, interrupted=interrupted)

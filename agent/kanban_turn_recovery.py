@@ -296,7 +296,7 @@ def _guardrail_halt_nudge(result: dict, *, attempt: int, max_attempts: int, task
     count = count if isinstance(count, int) and not isinstance(count, bool) else None
     detail = f" ({code}, count={count})" if code and count is not None else (f" ({code})" if code else "")
     suggested = _truncate(
-        f"guardrail halt: repeated {tool} call blocked{detail}; "
+        f"guardrail stop: repeated {tool} call blocked{detail}; "
         "the card needs a decision before it can proceed"
     )
     return (

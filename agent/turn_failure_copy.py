@@ -146,9 +146,9 @@ def exit_reason_failure(turn_exit_reason: Any) -> Optional[ExitFailure]:
 def worker_guardrail_halt_failure(
     turn_exit_reason: Any, *, interrupted: bool = False,
 ) -> Optional[ExitFailure]:
-    """Worker-gated failure verdict for a tool-loop guardrail halt.
+    """Worker-gated failure verdict for a tool-loop guardrail stop.
 
-    A guardrail stop (a block/halt on any tool) ends the turn with the interactive
+    A guardrail stop (a block on any tool) ends the turn with the interactive
     canned reply, and the exit-reason map has no entry for it: the turn read as
     COMPLETED, the worker exited ``rc=0`` with no terminal kanban call, and the
     dispatcher booked the run ``protocol_violation``/``crashed``. This verdict closes
@@ -158,7 +158,7 @@ def worker_guardrail_halt_failure(
     non-worker surfaces (cron, desktop, gateway, tool subprocesses) keep today's
     values field-for-field, and ``interrupted`` still wins. Retryable is deliberate:
     the dispatcher grants in-place retry authority only to a FAILED turn whose
-    classifier marked it ``retryable``, so the halt becomes one bounded in-process
+    classifier marked it ``retryable``, so the stop becomes one bounded in-process
     recovery (context preserved) instead of a cold respawn that re-reads everything.
     """
     if interrupted:
