@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent.tool_guardrails import ToolCallSignature
 
 # Demote tool results older than the newest N rounds so the tail budget binds
 # (the tool-group alignment floor otherwise keeps ~32K of tool output alive).
@@ -48,14 +51,17 @@ def skill_view_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str
 
 def demote_stale_tail_tools(
     messages: list[dict[str, Any]], tail_start: int, session_id: str,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, list[ToolCallSignature]]:
     """Demote tail tool results older than the newest ``_LEAN_TAIL_KEEP_TOOL_ROUNDS`` rounds to recovery stubs;
     skill-marker rows untouched. A demoted ``skill_view`` body carries the canonical reload marker, as its
     Phase-1 stub does, so the model does not act on instructions it no longer has (#32106). Returns a new list
-    (untouched rows shared, demoted copied) and the number of rows demoted."""
+    (untouched rows shared, demoted copied), the number of rows demoted, and the ``ToolCallSignature`` of each
+    demoted row's producing call (so the guardrails can drop tallies for content that left context)."""
     from agent.context_compressor import (
         SKILL_PRUNED_MARKER_PREFIX, _is_summary_stub, _result_failure_suffix, _rewritten, _skill_pruned_marker,
+        _tool_calls_by_id,
     )
+    from agent.tool_guardrails import signature_from_raw_call
 
     rounds_seen = 0
     protected: set[int] = set()
@@ -68,7 +74,9 @@ def demote_stale_tail_tools(
         protected.add(i)
     result = list(messages)
     demoted = 0
+    evicted: list[ToolCallSignature] = []
     skills: dict[str, str] | None = None
+    calls: dict[str, tuple] | None = None
     for i in range(tail_start, len(messages)):
         msg = messages[i]
         content = msg.get("content")
@@ -82,4 +90,8 @@ def demote_stale_tail_tools(
             stub += " " + _skill_pruned_marker(skill)
         result[i] = _rewritten(msg, stub)
         demoted += 1
-    return result, demoted
+        calls = _tool_calls_by_id(messages) if calls is None else calls
+        call = calls.get(str(msg.get("tool_call_id") or ""))
+        if call and (signature := signature_from_raw_call(*call)) is not None:
+            evicted.append(signature)
+    return result, demoted, evicted
