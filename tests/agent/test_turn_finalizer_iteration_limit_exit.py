@@ -95,12 +95,13 @@ def _finalize(
     exit_reason,
     api_call_count=60,
     pending_verification_response=None,
+    interrupted=False,
 ):
     return finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
-        interrupted=False,
+        interrupted=interrupted,
         failed=False,
         messages=[{"role": "user", "content": "task"}],
         conversation_history=[],
