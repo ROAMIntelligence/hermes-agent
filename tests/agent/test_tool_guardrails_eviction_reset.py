@@ -53,15 +53,18 @@ def _bound(controller) -> ContextCompressor:
 
 def test_demotion_evicts_signature_and_resets_no_progress_tally():
     controller = _controller()
-    _read_n(controller, 5)
-    original = PAYLOAD
-    out = _demote(_bound(controller))
-    assert out[2]["content"] != original  # the oldest result became a recovery stub
+    messages = _transcript()
+    pre_demotion = messages[2]["content"]  # the bytes the demotion will replace, captured first
 
-    before, after = _read(controller, result=original)
-    assert before.action == "allow"
-    assert after.count == 1
-    assert original == PAYLOAD  # re-read returns the same bytes the stub replaced
+    _read_n(controller, 5)
+    out = _demote(_bound(controller), messages)
+    stub = out[2]["content"]
+    assert stub != pre_demotion  # the oldest result became a recovery stub
+
+    before, after = _read(controller, result=pre_demotion)  # the tool re-reads the unchanged file
+    assert before.action == "allow"  # the no-progress block must NOT fire
+    assert after.count == 1  # the tally restarted instead of resuming at 5
+    assert pre_demotion == PAYLOAD  # byte-for-byte: the re-read value is the pre-demotion content
 
 
 def test_five_identical_no_demotion_still_block():
