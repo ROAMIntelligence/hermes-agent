@@ -12,7 +12,6 @@ worker predicate this PR adds to it is pinned here.
 
 from __future__ import annotations
 
-import inspect
 import os
 import sqlite3
 from pathlib import Path
@@ -778,8 +777,10 @@ def _stopped_turn_result(decision, *, interrupted: bool = False) -> dict:
     metadata) and stamped through the REAL seam verdict exactly the way
     ``agent/turn_finalizer.py`` consumes it: ``fails_turn`` -> ``failed=True``, then the
     ``completed=`` recompute (which follows the seam) reads False, and the assembly
-    stamps the verdict fields. On a non-worker (or interrupted) path the verdict is
-    None and the result keeps today's values field-for-field."""
+    stamps the verdict fields. Fixture double for the routing and replay tests - the
+    real ``finalize_turn`` leg is driven and pinned by
+    ``test_guardrail_halt_real_finalizer_contract``. On a non-worker (or interrupted)
+    path the verdict is None and the result keeps today's values field-for-field."""
     from agent.turn_failure_copy import stamp_failure, worker_guardrail_halt_failure
 
     result = {
@@ -897,9 +898,11 @@ def _drive_board_case(clear_kanban_env, root, monkeypatch, cli_harness, driver, 
 
 
 def test_guardrail_seam_values(clear_kanban_env):
-    """The exact verdict the finalizer seam lands, value-for-value: retryable on purpose
-    (in-place retry authority), and ONLY for the stripped worker predicate - the shared
-    exit-reason map is untouched, so every other surface keeps today's values."""
+    """The verdict TABLE the finalizer seam consumes, value-for-value: retryable on
+    purpose (in-place retry authority), and ONLY for the stripped worker predicate -
+    the shared exit-reason map is untouched, so every other surface keeps today's values.
+    The values this table lands on a REAL ``finalize_turn`` result, and the in-place retry
+    authority that follows, are pinned by ``test_guardrail_halt_real_finalizer_contract``."""
     from agent.turn_failure_copy import (
         ExitFailure,
         exit_reason_failure,
@@ -911,13 +914,6 @@ def test_guardrail_seam_values(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
     verdict = worker_guardrail_halt_failure("guardrail_halt")
     assert verdict == ExitFailure(reason="guardrail_halt", retryable=True, fails_turn=True)
-    stamped = _stopped_turn_result(_blocked_read_decision())
-    assert stamped["failed"] is True
-    assert stamped["completed"] is False  # a stop never reads as a completed turn
-    assert stamped["failure_reason"] == "guardrail_halt"
-    assert stamped["failure_retryable"] is True
-    assert should_recover_turn(stamped, attempt=0) is True  # -> in-place retry authority
-    assert should_recover_turn({**stamped, "interrupted": True}, attempt=0) is False
 
     clear_kanban_env.delenv("HERMES_KANBAN_TASK", raising=False)
     assert worker_guardrail_halt_failure("guardrail_halt") is None
@@ -928,14 +924,114 @@ def test_guardrail_seam_values(clear_kanban_env):
     assert worker_guardrail_halt_failure(None) is None
 
 
-def test_guardrail_seam_is_wired_into_the_finalizer():
-    """If the seam call is ever dropped, the stop silently reads as completed again."""
-    from agent.turn_finalizer import _resolve_turn_exit_failure, finalize_turn
+def test_guardrail_halt_real_finalizer_contract(clear_kanban_env, monkeypatch):
+    """Review round 1 (a): the seam values must come from the REAL ``finalize_turn``, not
+    a test-side re-assembly. Drives the production call through the in-tree ``_LimitAgent``
+    / ``_finalize`` harness: worker+guardrail_halt lands ``failed=True`` /
+    ``completed=False`` / ``failure_reason="guardrail_halt"`` / ``failure_retryable=True``;
+    non-worker keeps today's fields; ``interrupted`` stamps nothing; no-halt stays clean."""
+    from tests.agent.test_turn_finalizer_iteration_limit_exit import (
+        _LimitAgent,
+        _finalize,
+    )
 
-    src = inspect.getsource(finalize_turn)
-    assert "_resolve_turn_exit_failure(_turn_exit_reason, interrupted)" in src
-    helper = inspect.getsource(_resolve_turn_exit_failure)
-    assert "worker_guardrail_halt_failure(turn_exit_reason)" in helper
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    # Worker + guardrail_halt: production values on the production result.
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    agent = _LimitAgent(budget_remaining=60)
+    agent._tool_guardrail_halt_decision = _blocked_read_decision()
+    halted = _finalize(
+        agent,
+        final_response=_CANNED_HALT_REPLY,
+        exit_reason="guardrail_halt",
+        api_call_count=5,
+    )
+    assert halted["failed"] is True
+    assert halted["completed"] is False
+    assert halted["failure_reason"] == "guardrail_halt"
+    assert halted["failure_retryable"] is True
+    assert halted["guardrail"]["code"] == "idempotent_no_progress_block"
+    assert halted["guardrail"]["tool_name"] == "read_file"
+    assert halted["guardrail"]["count"] == 5
+    assert should_recover_turn(halted, attempt=0) is True  # in-place retry authority
+    assert should_recover_turn({**halted, "interrupted": True}, attempt=0) is False
+
+    # Non-worker + guardrail_halt: unchanged field-for-field (advisory doctrine).
+    clear_kanban_env.delenv("HERMES_KANBAN_TASK", raising=False)
+    agent = _LimitAgent(budget_remaining=60)
+    non_worker = _finalize(
+        agent,
+        final_response=_CANNED_HALT_REPLY,
+        exit_reason="guardrail_halt",
+        api_call_count=5,
+    )
+    assert non_worker["failed"] is False
+    assert non_worker["completed"] is True
+    assert "failure_reason" not in non_worker
+
+    # Interrupted worker: the seam yields nothing; no stamp.
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    agent = _LimitAgent(budget_remaining=60)
+    halted_interrupted = _finalize(
+        agent,
+        final_response=_CANNED_HALT_REPLY,
+        exit_reason="guardrail_halt",
+        api_call_count=5,
+        interrupted=True,
+    )
+    assert halted_interrupted["failed"] is False
+    assert halted_interrupted["completed"] is False
+    assert "failure_reason" not in halted_interrupted
+
+    # No-halt worker control: a normal text exit records no failure fields.
+    agent = _LimitAgent(budget_remaining=60)
+    clean = _finalize(
+        agent,
+        final_response="[fixture] done",
+        exit_reason="text_response(2)",
+        api_call_count=5,
+    )
+    assert clean["failed"] is False
+    assert clean["completed"] is True
+    assert "failure_reason" not in clean
+
+
+def test_guardrail_halt_completed_guard_is_load_bearing(clear_kanban_env, monkeypatch):
+    """Review round 1 (b), explicitly: on a halted worker turn with a LIVE final response
+    and iteration budget remaining, every other ``completed`` conjunct is True - only the
+    ``and not failed`` conjunct (agent/turn_finalizer.py:611 at the reviewed revision)
+    keeps the recorded turn from reading as completed. Weaken it and this test goes RED."""
+    from tests.agent.test_turn_finalizer_iteration_limit_exit import (
+        _LimitAgent,
+        _finalize,
+    )
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    agent = _LimitAgent(budget_remaining=60)
+    agent._tool_guardrail_halt_decision = _blocked_read_decision()
+    halted = _finalize(
+        agent,
+        final_response=_CANNED_HALT_REPLY,
+        exit_reason="guardrail_halt",
+        api_call_count=5,
+    )
+    # final_response set + not interrupted + 5 < max_iterations(60): if ``and not failed``
+    # were weakened, ``completed`` would flip True here (the state the INVARIANT forbids).
+    assert halted["failed"] is True and halted["completed"] is False
+
+    # Twin control - same response and budget, halt removed: completed flips back, so the
+    # assertion above is about the guard, not about the other conjuncts being inert.
+    agent = _LimitAgent(budget_remaining=60)
+    clean = _finalize(
+        agent,
+        final_response=_CANNED_HALT_REPLY,
+        exit_reason="text_response(5)",
+        api_call_count=5,
+    )
+    assert clean["completed"] is True
 
 
 def test_guardrail_nudge_allowlist_and_leak_check(clear_kanban_env):
