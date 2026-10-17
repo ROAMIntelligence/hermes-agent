@@ -178,6 +178,17 @@ class ToolCallSignature:
         return asdict(self)
 
 
+def signature_from_raw_call(tool_name: str, raw_args: Any) -> ToolCallSignature | None:
+    """Signature for a transcript tool call (``raw_args`` is the JSON string or dict stored on the message)."""
+    try:
+        parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    except ValueError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    return ToolCallSignature.from_call(tool_name, parsed)
+
+
 @dataclass(frozen=True)
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
@@ -317,6 +328,8 @@ class ToolCallGuardrailController:
         # signature -> a mutating call succeeded since its last failure
         self._progress_since_failure: dict[ToolCallSignature, bool] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        # signatures whose one-shot eviction credit is spent this turn (see note_content_evicted)
+        self._eviction_reset_used: set[ToolCallSignature] = set()
         self._halt_decision: ToolGuardrailDecision | None = None
         # Identical-call streak: CONSECUTIVE identical (tool, args, result) calls; any different call or
         # result resets it, so re-reads after edits and varied polling are never flagged.
@@ -337,6 +350,20 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+
+    def note_content_evicted(self, signature: ToolCallSignature) -> bool:
+        """Explicit "content evicted" reset: compaction demoted this signature's result out of context.
+
+        Clears the ``idempotent_no_progress`` tally so the recovery re-read is not blocked for repeats of
+        content the model can no longer see. One-shot per signature per turn: the credit is consumed on the
+        FIRST demotion of that signature EVEN WHEN NO TALLY EXISTED, so a loop whose repeats interleave with
+        demotions still accumulates and the guard still fires at the normal bound. Only the no-progress
+        record is touched; exact-failure records and the threshold are untouched. Returns whether a tally
+        was cleared."""
+        if signature in self._eviction_reset_used:
+            return False
+        self._eviction_reset_used.add(signature)
+        return self._no_progress.pop(signature, None) is not None
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:

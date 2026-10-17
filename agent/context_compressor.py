@@ -2321,6 +2321,10 @@ class ContextCompressor(
         self._compression_telemetry_seed = None
         self._reset_proactive_prune_rearm()
 
+    def bind_tool_guardrails(self, controller: Any) -> None:
+        """Bind the agent's tool-call guardrail controller so demotion can report evicted results."""
+        self._tool_guardrails = controller
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
@@ -3659,10 +3663,20 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     def _demote_stale_tail_tools(self, messages: list[dict[str, Any]], tail_start: int) -> list[dict[str, Any]]:
         """Lean mode: demote stale tail tool results to recovery stubs (``demote_stale_tail_tools``)."""
-        result, demoted = demote_stale_tail_tools(messages, tail_start, getattr(self, "_session_id", "") or "")
+        result, demoted, evicted = demote_stale_tail_tools(messages, tail_start, getattr(self, "_session_id", "") or "")
         if demoted and not self.quiet_mode:
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
+        if evicted:
+            self._notify_content_evicted(evicted)
         return result
+
+    def _notify_content_evicted(self, signatures: list[Any]) -> None:
+        """Tell the bound tool-call guardrails that these calls' results left context (one-shot tally reset)."""
+        controller = getattr(self, "_tool_guardrails", None)
+        if controller is None:
+            return
+        for signature in signatures:
+            controller.note_content_evicted(signature)
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""

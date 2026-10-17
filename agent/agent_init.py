@@ -2016,6 +2016,12 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     if callable(_bind_session_state):
         with suppress(Exception):
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
+    # The demotion site must be able to tell the guard that content left context (one-shot tally reset).
+    # Plugin engines without the method are skipped by the callable check.
+    _bind_guardrails = getattr(agent.context_compressor, "bind_tool_guardrails", None)
+    _guardrails = getattr(agent, "_tool_guardrails", None)
+    if callable(_bind_guardrails) and _guardrails is not None:
+        _bind_guardrails(_guardrails)
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
