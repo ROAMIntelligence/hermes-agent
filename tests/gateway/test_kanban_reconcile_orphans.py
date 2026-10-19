@@ -11,8 +11,9 @@ the existing recovery paths ever touch such a card:
 - ``detect_stale_running`` is disabled by default (``stale_timeout=0``).
 
 Result: a zombie card that shows Running forever. ``reconcile_orphaned_running``
-is the reconciliation pass: it finds those orphans, requeues them to ``ready``
-with an explanatory note, and logs a ``reconciled`` event. Wired into
+is the reconciliation pass: it finds those orphans and requeues them to the lane
+they were claimed for (``ready``, or ``review`` for a review-lane run) with an
+explanatory note, and logs a ``reconciled`` event. Wired into
 ``dispatch_once`` each tick, gated by ``kanban.reconcile_orphans`` (config.yaml,
 default on) at the gateway watcher layer.
 
@@ -140,6 +141,30 @@ class TestReconcileOrphanedRunning:
         _orphan_running(conn, tid, worker_pid=dead.pid)
 
         assert kbd.reconcile_orphaned_running(conn) == [tid]
+
+    def test_review_lane_orphan_returns_to_review(self, conn):
+        """A dead REVIEW-lane run goes back to ``review`` (the lane
+        ``_retry_status_for_run`` exists to preserve), not the implementation
+        queue: it must stay claimable by the reviewer lane, not by a builder."""
+        tid = kb.create_task(conn, title="review-zombie", assignee="w")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.claim_review_task(conn, tid) is not None
+
+        # The reviewer worker died mid-claim: claim_expires NULL while running.
+        conn.execute("UPDATE tasks SET claim_expires=NULL WHERE id=?", (tid,))
+        conn.commit()
+
+        assert kbd.reconcile_orphaned_running(conn) == [tid]
+
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["status"] == "review"
+        assert any("requeued to review" in (c.body or "")
+                   for c in kb.list_comments(conn, tid))
+        # The implementer lane must not touch it; the reviewer lane can re-claim.
+        assert kb.claim_task(conn, tid) is None
+        assert kb.claim_review_task(conn, tid) is not None
 
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
