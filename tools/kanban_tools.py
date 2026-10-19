@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
-from hermes_cli.config import cfg_get, load_config
+from hermes_cli.config import cfg_get, load_config, split_model_config_default
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
@@ -1029,6 +1029,31 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _materialize_create_pin(
+    model: Optional[str], provider: Optional[str], parent_task: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the ``(model, provider)`` pin a new card is created with.
+
+    Per field, first non-empty wins:
+      1. Explicit ``model`` / ``provider`` args.
+      2. The creating card's ``model_override`` / ``provider_override`` (``parent_task``).
+      3. The profile's config default, read at call time (one process may serve several
+         profiles): ``model.default`` via ``split_model_config_default``, with the provider
+         falling back to ``model.provider`` when the default carries none.
+    Nothing is invented: a field no step resolves stays None.
+    """
+    model = model or (getattr(parent_task, "model_override", None) or None)
+    provider = provider or (getattr(parent_task, "provider_override", None) or None)
+    if model and provider:
+        return model, provider
+    model_cfg = load_config().get("model")
+    cfg_model, cfg_provider = split_model_config_default(
+        model_cfg.get("default") if isinstance(model_cfg, dict) else model_cfg)
+    if not cfg_provider and isinstance(model_cfg, dict):
+        cfg_provider = str(model_cfg.get("provider") or "").strip()
+    return model or cfg_model or None, provider or cfg_provider or None
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1048,8 +1073,6 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
-    model_override, provider_override = args.get("model"), args.get("provider")
-    _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
@@ -1068,6 +1091,10 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        model_override, provider_override = _materialize_create_pin(
+            args.get("model"), args.get("provider"), self_task)
+        _check(model_override or not provider_override,
+               "'provider' requires a model: pass 'model', or configure a default model")
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
