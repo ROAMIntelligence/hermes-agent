@@ -139,3 +139,136 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+
+
+# ---------------------------------------------------------------------------
+# Guardrail preservation — Stack fit line + red-team provenance survive
+# ---------------------------------------------------------------------------
+
+_FIXTURE_STACK_FIT = (
+    "Stack fit: no MCP fits (no cron/config MCP exists). "
+    "Skills: hermes-cron-ops. Lane: software-developer. Rejected: a plugin."
+)
+
+_FIXTURE_REDTEAM_BLOCK = (
+    "<!-- redteam: v1 lens=security model=deepseek/deepseek-v4.1-flash ts=1791875274 sha=520a16a50a3d -->\n"
+    "\n"
+    "## Red team (preflight)\n"
+    "\n"
+    "VERDICT: REVISE\n"
+    "WHY: no acceptance criteria anywhere.\n"
+    "\n"
+    "PRIORITY FIXES:\n"
+    "1) Write acceptance criteria a worker can falsify.\n"
+    "\n"
+    "CONFIDENCE: medium\n"
+)
+
+_FIXTURE_SPEC_BODY = (
+    "Phase 2 of the live-store reconciler.\n"
+    "\n"
+    "WHAT IT ADDS\n"
+    "1. per-field merge.\n"
+    "\n"
+    + _FIXTURE_STACK_FIT + "\n"
+    "\n"
+    + _FIXTURE_REDTEAM_BLOCK
+)
+
+_REWRITE_BODY = "**Goal**\nShip the reconciler.\n\n**Approach**\n- merge per field."
+
+
+def _specify_reply(body: str) -> str:
+    return jsonlib.dumps({"title": "Refined reconciler", "body": body})
+
+
+def test_specify_reattaches_dropped_guardrails_byte_exact(kanban_home):
+    """A rewrite that drops both guardrail spans must not lose them (AC a).
+
+    MUST FAIL on the unfixed build — this is the falsifiability anchor.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="reconciler phase 2", body=_FIXTURE_SPEC_BODY, triage=True,
+        )
+
+    p, _ = _patch_aux_client(_specify_reply(_REWRITE_BODY))
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+    assert outcome.ok is True
+
+    with kbc.connect() as conn:
+        body = kb.get_task(conn, tid).body or ""
+
+    assert _REWRITE_BODY in body
+    assert _FIXTURE_STACK_FIT in body
+    assert _FIXTURE_REDTEAM_BLOCK.rstrip("\n") in body
+    assert body.count("<!-- redteam:") == 1
+    assert body.rstrip().endswith(_FIXTURE_REDTEAM_BLOCK.rstrip("\n"))
+
+
+def test_specify_kept_guardrails_are_not_duplicated(kanban_home):
+    """A rewrite that already echoes the spans must not duplicate them."""
+    keep = _REWRITE_BODY + "\n\n" + _FIXTURE_STACK_FIT + "\n\n" + _FIXTURE_REDTEAM_BLOCK
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="reconciler phase 2", body=_FIXTURE_SPEC_BODY, triage=True,
+        )
+
+    p, _ = _patch_aux_client(_specify_reply(keep))
+    with p:
+        assert spec.specify_task(tid, author="ace").ok is True
+
+    with kbc.connect() as conn:
+        body = kb.get_task(conn, tid).body or ""
+    assert body.count(_FIXTURE_STACK_FIT) == 1
+    assert body.count("<!-- redteam:") == 1
+
+
+def test_specify_without_guardrails_is_byte_identical(kanban_home):
+    """Cards without the spans keep the pre-fix rewrite output exactly (AC c)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", body="rough notes only", triage=True)
+
+    p, _ = _patch_aux_client(_specify_reply(_REWRITE_BODY))
+    with p:
+        assert spec.specify_task(tid, author="ace").ok is True
+
+    with kbc.connect() as conn:
+        body = kb.get_task(conn, tid).body or ""
+    assert body == _REWRITE_BODY
+
+
+def test_specify_title_only_reply_leaves_body_untouched(kanban_home):
+    """A title-only reply does not rewrite the body — guardrails stay."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="reconciler phase 2", body=_FIXTURE_SPEC_BODY, triage=True,
+        )
+
+    p, _ = _patch_aux_client(jsonlib.dumps({"title": "Refined"}))
+    with p:
+        assert spec.specify_task(tid, author="ace").ok is True
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.body == _FIXTURE_SPEC_BODY
+
+
+def test_guardrail_segments_matches_bullet_and_bold_forms():
+    """The extractor catches the gate's bullet/bold-wrapped form + the tail."""
+    body = (
+        "intro\n"
+        "\n"
+        "- **Stack fit:** bulleted form.\n"
+        "\n"
+        "<!-- redteam: v1 lens=x -->\n"
+        "\n"
+        "## Red team (preflight)\n"
+        "\n"
+        "VERDICT: OK\n"
+    )
+    segs = spec._guardrail_segments(body)
+    assert segs[0] == "- **Stack fit:** bulleted form."
+    assert segs[-1].startswith("<!-- redteam: v1 lens=x -->")
+    assert segs[-1].rstrip().endswith("VERDICT: OK")
