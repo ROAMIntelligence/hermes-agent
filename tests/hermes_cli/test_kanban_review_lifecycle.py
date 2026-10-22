@@ -615,7 +615,7 @@ def test_active_pr_guard_lifts_after_dependency_resume_promotion(
     ``recompute_ready`` resumes the card with a ``promoted`` event — a
     deliberate re-queue that changes no assignee, so it never lifted the
     guard: the card sat held for the whole 24h window with no
-    operator-reachable escape (t_b696f780: nine guarded ticks 18:02–18:20Z,
+    operator-reachable escape (t_b696f780: seven guarded ticks 18:02–18:20Z,
     hand-lifted only by a reassign round-trip). The promotion lifts only
     strictly AFTER the newest PR comment; a crash/reclaim after the comment
     is still not a handoff (fail closed).
