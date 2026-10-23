@@ -196,15 +196,25 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: dict[int, tuple[int, float]] = {}
 
-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+# ``_default_spawn`` parks each worker's ``Popen`` here and ``reap_worker_zombies``
+# polls it — on EVERY host, because that handle is the reaper's whole reach.
+# Entry: ``pid -> Popen``. The POSIX arm's ``os.waitpid(-1, WNOHANG)`` instead
+# reaped *any* child of the sweeping process: a cron script child's status was
+# consumed here and its owner then read ``returncode == 0`` for a failed run.
 _live_worker_procs: dict[int, subprocess.Popen] = {}
 
 
 def _wait_status_from_returncode(returncode: int) -> int:
-    """Encode a ``Popen.returncode`` in the wait-status layout the registry stores."""
-    return (int(returncode) & 0xFF) << 8
+    """Encode ``Popen.returncode`` in the wait-status layout the registry stores.
+
+    ``_classify_worker_exit`` reads the bits: low 7 = signal, 8-15 = exit code.
+    POSIX reports a signalled child as ``-signum``, so ``& 0xFF`` alone would
+    book a SIGKILLed worker as a plain nonzero exit.
+    """
+    code = int(returncode)
+    if code < 0:
+        return (-code) & 0x7F
+    return (code & 0xFF) << 8
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -280,32 +290,21 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
 
 
 def reap_worker_zombies() -> list[int]:
-    """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
-    every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
-    parked by ``_default_spawn`` (the only way to learn a child's exit code
-    there), so the rate-limit sentinel exit is classified on both hosts."""
+    """Reap exited workers without blocking; returns reaped PIDs.
+
+    Polls only the ``Popen`` handles ``_default_spawn`` parked in
+    ``_live_worker_procs``: every other child of this process keeps its status
+    for the owner that spawned it (cron's ``_run_job_script``, MCP servers).
+    An entry with no ``poll()`` is skipped, so nothing raises out of a tick.
+    """
     reaped: list[int] = []
-    if _kb._IS_WINDOWS:
-        for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
-            if returncode is None:
-                continue
-            _record_worker_exit(pid, _wait_status_from_returncode(returncode))
-            _live_worker_procs.pop(pid, None)
-            reaped.append(pid)
-        return reaped
-    try:
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid == 0:
-                break
-            _record_worker_exit(pid, status)
-            reaped.append(pid)
-    except Exception:
-        pass
+    for pid, proc in list(_live_worker_procs.items()):
+        returncode = proc.poll() if hasattr(proc, "poll") else None
+        if returncode is None:
+            continue
+        _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+        _live_worker_procs.pop(pid, None)
+        reaped.append(pid)
     return reaped
 
 
@@ -2964,8 +2963,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
+    # Park on EVERY host: this handle is the reaper's only reach.
+    _live_worker_procs[proc.pid] = proc
     return proc.pid
 
 
