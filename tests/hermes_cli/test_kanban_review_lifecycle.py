@@ -605,6 +605,83 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
 
 
+def test_active_pr_guard_lifts_after_dependency_resume_promotion(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dependency-resume promotion after the PR comment lifts ``active_pr``.
+
+    t_ec165b42: a card parked on its parent (``todo``) can already carry the
+    PR URL from its earlier work. When the parent completes, the board's own
+    ``recompute_ready`` resumes the card with a ``promoted`` event — a
+    deliberate re-queue that changes no assignee, so it never lifted the
+    guard: the card sat held for the whole 24h window with no
+    operator-reachable escape (t_b696f780: seven guarded ticks 18:02–18:20Z,
+    hand-lifted only by a reassign round-trip). The promotion lifts only
+    strictly AFTER the newest PR comment; a crash/reclaim after the comment
+    is still not a handoff (fail closed).
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/77 for review."
+
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocking parent", assignee="dev")
+        child_id = kb.create_task(
+            conn, title="resumed with open pr", assignee="dev", parents=[parent_id],
+        )
+        kb.add_comment(conn, child_id, author="dev", body=pr_comment)
+        _backdate_comments(conn, child_id)
+
+        # (a) Still parked on the parent: no promotion yet -> held.
+        assert kb.get_task(conn, child_id).status == "todo"
+        assert kbd.check_respawn_guard(conn, child_id) == "active_pr"
+
+        # (b) Completing the parent promotes the card ('promoted' after the
+        #     PR comment): the resume is a deliberate re-queue, guard lifts.
+        pclaim = kb.claim_task(conn, parent_id)
+        assert pclaim is not None
+        assert kb.complete_task(conn, parent_id, summary="parent done") is True
+        assert kb.get_task(conn, child_id).status == "ready"
+        assert kbd.check_respawn_guard(conn, child_id) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert child_id in [s[0] for s in res.spawned]
+        assert child_id not in dict(res.respawn_guarded)
+
+        # (c) Same ordering when the promotion happens inside the tick
+        #     itself (parent marked done out-of-band): recompute writes
+        #     'promoted', then the guard reads it — still a lift.
+        parent2 = kb.create_task(conn, title="blocking parent 2", assignee="dev")
+        child2 = kb.create_task(
+            conn, title="resumed in-tick", assignee="dev", parents=[parent2],
+        )
+        kb.add_comment(conn, child2, author="dev", body=pr_comment)
+        _backdate_comments(conn, child2)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent2,))
+        assert kbd.check_respawn_guard(conn, child2) == "active_pr"
+        res2 = kbd.dispatch_once(conn, dry_run=True)
+        assert res2.promoted == 1
+        assert child2 in [s[0] for s in res2.spawned]
+        assert child2 not in dict(res2.respawn_guarded)
+
+        # (d) A handoff must land strictly AFTER the newest PR comment: a
+        #     newer PR comment (the resumed worker posting to the PR) re-arms.
+        kb.add_comment(conn, child_id, author="dev", body=pr_comment)
+        assert kbd.check_respawn_guard(conn, child_id) == "active_pr"
+
+        # (e) A crash/reclaim after that comment is not a handoff: still held.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'reclaimed', NULL, ?)",
+                (child_id, int(__import__("time").time())),
+            )
+        assert kbd.check_respawn_guard(conn, child_id) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
