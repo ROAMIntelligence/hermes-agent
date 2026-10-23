@@ -384,6 +384,150 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+# ---------------------------------------------------------------------------
+# Gateway recycle: a worker whose PID vanished because the WHOLE GATEWAY
+# rebooted (container recycle) between spawn and reclaim must requeue to
+# ``ready`` WITHOUT counting a failure — the worker's own death proves
+# nothing about the task. Regression for the 2026-10-12 incident where a
+# single recycle mid-fleet blocked every in-flight card on the board.
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_recycle_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A dead worker whose spawn-time instantiation epoch no longer matches the
+    CURRENT gateway's epoch (the gateway rebooted since it was spawned) must
+    requeue to ``ready`` and leave ``consecutive_failures`` untouched, even
+    across many such recycles."""
+    import types as _types
+
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    # Fake out gateway.drain_control so the module import inside
+    # ``_gateway_rebooted_since`` resolves without a real gateway process.
+    fake_drain_control = _types.ModuleType("gateway.drain_control")
+    fake_drain_control.current_instantiation_epoch = lambda: "epoch-AFTER-RECYCLE"
+    monkeypatch.setitem(sys.modules, "gateway.drain_control", fake_drain_control)
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="recycled", assignee="a")
+
+        for i in range(6):
+            pid = 71000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, worker_started_at=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, "epoch-BEFORE-RECYCLE|12345.0", 0, tid),
+            )
+            conn.commit()
+            # No _record_worker_exit call: a fresh (rebooted) gateway process
+            # has an empty reap registry, so classification falls through to
+            # the "unknown" / pid-not-alive branch -- the common real shape
+            # for a worker killed by a container recycle.
+
+            # Unlike a rate-limit requeue, an infra interruption is still
+            # reported in the crashed-ids list (for visibility) — only the
+            # failure-count ACCOUNTING is waived, asserted below.
+            kbd.detect_crashed_workers(conn)
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: a gateway recycle must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        assert task.last_failure_error and "infrastructure" in task.last_failure_error
+
+        # A "crashed" run outcome is still recorded (for visibility) but it
+        # must carry the infrastructure marker in its event payload.
+        events = [
+            json.loads(r["payload"]) for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND payload LIKE '%infrastructure%'",
+                (tid,),
+            ).fetchall()
+        ]
+        assert events, "expected at least one event payload tagged infrastructure=True"
+        assert any(e.get("infrastructure") is True for e in events)
+
+
+def test_gateway_recycle_streak_trips_past_bounded_cap(kanban_home, monkeypatch):
+    """An infra interruption never counts against ``consecutive_failures`` on its
+    own, but the exemption is BOUNDED: a task hit by ``_INFRASTRUCTURE_INTERRUPT_LIMIT``
+    consecutive recycles in a row must stop being exempted and trip for real, so a
+    task that keeps losing that race (or itself provokes the recycle) surfaces to an
+    operator instead of requeuing forever unexamined."""
+    import types as _types
+
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    fake_drain_control = _types.ModuleType("gateway.drain_control")
+    fake_drain_control.current_instantiation_epoch = lambda: "epoch-AFTER-RECYCLE"
+    monkeypatch.setitem(sys.modules, "gateway.drain_control", fake_drain_control)
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="recycled-repeatedly", assignee="a")
+
+        limit = _kbd._INFRASTRUCTURE_INTERRUPT_LIMIT
+        for i in range(limit - 1):
+            pid = 72000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, worker_started_at=? WHERE id=?",
+                (pid, "epoch-BEFORE-RECYCLE|12345.0", tid),
+            )
+            conn.commit()
+            kbd.detect_crashed_workers(conn)
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: below the cap should still requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: below the cap a recycle must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # One more recycle reaches the cap: this one must trip for real.
+        pid = 72000 + limit
+        kb.claim_task(conn, tid, claimer=f"{host}:wN")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, worker_started_at=? WHERE id=?",
+            (pid, "epoch-BEFORE-RECYCLE|12345.0", tid),
+        )
+        conn.commit()
+        kbd.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"the {limit}th consecutive recycle must trip the breaker, got {task.status}"
+        )
+
+        events = [
+            json.loads(r["payload"]) for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND payload LIKE '%infrastructure_limit_exceeded%'",
+                (tid,),
+            ).fetchall()
+        ]
+        assert events, "expected an event marking the infra-cap trip"
+        assert any(e.get("infrastructure_streak") == limit for e in events)
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_home, monkeypatch, lane):
     """A worker that exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` (credential revoked, model
