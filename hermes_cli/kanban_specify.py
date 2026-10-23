@@ -109,6 +109,53 @@ def _nonblank(v) -> Optional[str]:
     return v if isinstance(v, str) and v.strip() else None
 
 
+_STACK_FIT_LINE_RE = re.compile(
+    r"(?m)^[ \t]*(?:[-*+>][ \t]+)?[*_`]*Stack[ \t]*fit[*_`]*[ \t]*:.*$",
+    re.IGNORECASE,
+)
+_REDTEAM_MARKER_LINE_RE = re.compile(r"(?m)^<!--[ \t]*redteam:.*-->[ \t]*$")
+
+
+def _guardrail_segments(body: str) -> list[str]:
+    """Verbatim spans a rewrite must carry forward.
+
+    * every ``Stack fit:`` line in the card's own prose (the stack-fit gate
+      reads plain, bullet-prefixed and bold/backtick-wrapped forms);
+    * the red-team provenance tail: from the sweep's ``<!-- redteam: ... -->``
+      marker to the end of the body. The sweep splices its block at the tail,
+      so anything riding behind the marker is part of the same span and is
+      carried rather than risk losing it.
+    """
+    if not body:
+        return []
+    tail_at: Optional[int] = None
+    marker = _REDTEAM_MARKER_LINE_RE.search(body)
+    if marker:
+        tail_at = marker.start()
+    segments: list[str] = []
+    for m in _STACK_FIT_LINE_RE.finditer(body):
+        if tail_at is not None and m.start() >= tail_at:
+            continue
+        seg = m.group(0).rstrip()
+        if seg and seg not in segments:
+            segments.append(seg)
+    if tail_at is not None:
+        segments.append(body[tail_at:].rstrip())
+    return segments
+
+
+def _preserve_guardrails(new_body: str, original_body: str) -> str:
+    """Re-attach, byte-exact, any guardrail span the rewrite dropped.
+
+    No-op — returns ``new_body`` unchanged — when the card carried neither
+    span, or when the rewrite already kept every span.
+    """
+    missing = [s for s in _guardrail_segments(original_body) if s not in new_body]
+    if not missing:
+        return new_body
+    return new_body.rstrip() + "\n\n" + "\n\n".join(missing) + "\n"
+
+
 def _title_body(parsed: dict) -> tuple[Optional[str], Optional[str]]:
     """``(title, body)`` from an LLM reply: title stripped, body verbatim,
     either None when missing/blank."""
@@ -219,6 +266,12 @@ def specify_task(
         new_title, new_body = _title_body(parsed)
         if new_body is None and new_title is None:
             return SpecifyOutcome(task_id, False, "LLM response missing title and body")
+
+    if new_body is not None:
+        # The rewrite replaces the body wholesale: re-attach any guardrail span
+        # (Stack fit line / red-team provenance tail) the model did not echo,
+        # byte-exact. Cards carrying neither span are untouched.
+        new_body = _preserve_guardrails(new_body, task.body or "")
 
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
