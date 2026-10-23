@@ -869,9 +869,11 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     A task ``running`` with NULL ``claim_lock``/``claim_expires`` (crash
     mid-claim, manual SQL, DB restore) is a zombie forever: ``release_stale_claims``
     needs ``claim_expires``, ``detect_crashed_workers`` needs a host-local lock +
-    pid, ``detect_stale_running`` is off by default. Orphans go back to ``ready``
-    with a comment, leaked run closed, ``reconciled`` event; a row with a live
-    host-local PID is deferred so no duplicate spawns beside it.
+    pid, ``detect_stale_running`` is off by default. Orphans go back to their
+    retry lane -- ``ready``, or ``review`` when the dead run was a review claim
+    (``_retry_status_for_run``, like every other reclaim path) -- with a comment,
+    leaked run closed, ``reconciled`` event; a row with a live host-local PID is
+    deferred so no duplicate spawns beside it.
     """
     now = int(time.time())
     reconciled: list[str] = []
@@ -891,13 +893,18 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            # An orphaned run goes back to the lane it was claimed for
+            # (``_retry_status_for_run``) -- a dead reviewer run must not land
+            # in the implementation queue. Read it before ``_end_run`` closes
+            # the run.
+            retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (retry_status, tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -917,7 +924,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             _kb._insert_comment(
                 conn, tid, "dispatcher",
                 "reconciliation: card was 'running' with no valid claim "
-                "(dead/gone worker) — requeued to ready",
+                f"(dead/gone worker) — requeued to {retry_status}",
                 now,
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
