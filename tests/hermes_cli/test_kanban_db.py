@@ -362,6 +362,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             assert tid in rl
 
             task = kb.get_task(conn, tid)
+            assert task.last_failure_error is None, (
+                f"hit {i}: a rate-limit requeue must not stamp last_failure_error, "
+                f"got {task.last_failure_error!r}")
             assert task.status == "ready", (
                 f"hit {i}: should requeue ready, got {task.status}"
             )
@@ -370,9 +373,16 @@ def test_rate_limit_exit_requeues_without_counting_failure(
                 f"got {task.consecutive_failures}"
             )
 
-        # Last failure error stamped so the respawn guard recognizes the
-        # quota wall.
-        assert task.last_failure_error and "rate-limited" in task.last_failure_error
+        # NOT stamped: the note would be re-read as failure evidence by
+        # ``check_respawn_guard``'s blocker_auth branch and park the card
+        # forever (#119070). The fact lives on the run row + event.
+        assert task.last_failure_error is None
+        latest = conn.execute(
+            "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "rate_limited"
+        assert "rate-limited" in (latest["error"] or "")
 
         # A ``rate_limited`` run outcome was recorded (not ``crashed``).
         outcomes = [
@@ -382,6 +392,99 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+
+
+def _rate_limit_requeue(conn, tid, pid, claimer):
+    """Drive one REAL rate-limited requeue (rc=75) through detect_crashed_workers."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    kb.claim_task(conn, tid, claimer=claimer)
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+        (pid, 0, tid),
+    )
+    conn.commit()
+    _kbd._record_worker_exit(pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+    crashed = kbd.detect_crashed_workers(conn)
+    assert tid not in crashed
+    assert tid in getattr(_kbd.detect_crashed_workers, "_last_rate_limited", [])
+
+
+def test_rate_limit_requeue_leaves_prior_failure_text_untouched(
+    kanban_home, monkeypatch,
+):
+    """A rate-limit requeue neither overwrites nor clears a genuine prior
+    failure text: it simply does not write the column (#119070)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    prior = "genuine prior failure: executor died mid-run"
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="rl-prior", assignee="a")
+        conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?",
+                     (prior, tid))
+        conn.commit()
+
+        _rate_limit_requeue(conn, tid, 72000, f"{host}:w0")
+
+        task = kb.get_task(conn, tid)
+        assert task.last_failure_error == prior
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        latest = conn.execute(
+            "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "rate_limited"
+        assert "rate-limited" in (latest["error"] or "")
+
+
+def test_rate_limit_requeues_never_park_the_respawn_guard(
+    kanban_home, monkeypatch,
+):
+    """Repeated quota walls space the respawn by the cooldown and never leave
+    the guard a ``blocker_auth`` verdict (#119070): one respawn per window,
+    never parked forever."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    real_time = _kb.time.time
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="rl-guard-real", assignee="a")
+
+        for i in range(2):
+            monkeypatch.setattr(_kb.time, "time", real_time)
+            _rate_limit_requeue(conn, tid, 73000 + i, f"{host}:w{i}")
+
+            task = kb.get_task(conn, tid)
+            assert task.last_failure_error is None, f"requeue {i}"
+            assert task.consecutive_failures == 0, f"requeue {i}"
+            assert task.status == "ready", f"requeue {i}"
+
+            latest = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            ended = _kb._to_epoch(latest["ended_at"])
+            assert ended is not None
+
+            monkeypatch.setattr(_kb.time, "time", lambda: ended + 100)
+            assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+            monkeypatch.setattr(_kb.time, "time", lambda: ended + 301)
+            assert kbd.check_respawn_guard(conn, tid) is None
+            for delta in (1, 100, 299, 301, 1801, 3600):
+                monkeypatch.setattr(_kb.time, "time", lambda d=delta: ended + d)
+                verdict = kbd.check_respawn_guard(conn, tid)
+                assert verdict in {"rate_limit_cooldown", None}, (
+                    f"requeue {i}, +{delta}s: got {verdict!r}")
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
