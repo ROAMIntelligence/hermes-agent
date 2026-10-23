@@ -268,3 +268,108 @@ def test_notifier_seam_connect_lands_on_pinned_db(monkeypatch, tmp_path):
             assert any(r[0] == "pinned task" for r in rows), (
                 f"per-slug connect lost the pinned DB for board={slug!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# t_c7e60bbb: an inherited dispatcher pin must not outlive the board root the
+# process actually operates on. Every dispatcher worker runs with
+# HERMES_KANBAN_DB exported and hands it to whatever it spawns; the pin wins over
+# HERMES_HOME, so a probe/fixture that isolated itself by moving HERMES_HOME still
+# opened - and, on a missing file, initialized - the live board the pin named.
+# connect() now reports that loudly, and isolated_board()/isolated_board_env()
+# are the supported way to ask for a throwaway board.
+# ---------------------------------------------------------------------------
+
+def test_inherited_pin_outside_the_process_root_warns_loudly(monkeypatch, tmp_path, caplog):
+    """The reported shape: HERMES_HOME moved to a scratch root, inherited pin still
+    pointing at another tree's board. connect() must not be silent about landing on
+    a board that is not the caller's own."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    probe_home = tmp_path / "probe-home"
+    probe_home.mkdir()
+    foreign = tmp_path / "live" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(probe_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign))  # inherited dispatcher pin
+
+    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db_connect"):
+        with kbc.connect() as conn:
+            resolved = conn.execute("PRAGMA database_list").fetchone()[2]
+
+    assert resolved == str(foreign), resolved
+    assert "HERMES_KANBAN_DB" in caplog.text, caplog.text
+    assert str(foreign) in caplog.text, caplog.text
+
+
+def test_pin_under_the_process_root_is_quiet(monkeypatch, tmp_path, caplog):
+    """The real worker/dispatcher shape - a pin derived from this process's own board
+    root - keeps working and stays silent, so the warning cannot become noise."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = tmp_path / "worker-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+
+    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db_connect"):
+        with kbc.connect() as conn:
+            resolved = conn.execute("PRAGMA database_list").fetchone()[2]
+    assert resolved == str(home / "kanban.db"), resolved
+    assert not caplog.records, caplog.text
+
+
+def test_isolated_board_env_clears_an_inherited_worker_pin(monkeypatch, tmp_path):
+    """A probe that only moves HERMES_HOME keeps the live board; a probe that builds
+    its child env with isolated_board_env() does not, and its writes cannot reach the
+    pinned board (value-level: pinned board bytes and rows unchanged)."""
+    import hashlib
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    foreign = tmp_path / "live" / "kanban.db"
+    worker_env = dict(os.environ)
+    worker_env["HERMES_KANBAN_HOME"] = str(tmp_path / "live")
+    worker_env["HERMES_KANBAN_DB"] = str(foreign)
+    worker_env["HERMES_KANBAN_BOARD"] = "live"
+    worker_env["HERMES_DELEGATED_CHILD_CONTEXT"] = str(tmp_path / "live")
+
+    probe_root = tmp_path / "probe-root"
+    probe_root.mkdir()
+    env = kbc.isolated_board_env(probe_root, base=worker_env)
+    assert not any(
+        k in env for k in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_DELEGATED_CHILD_CONTEXT")
+    )
+    assert env["HERMES_KANBAN_HOME"] == str(probe_root)
+
+    with monkeypatch.context() as ctx:
+        ctx.setenv("HERMES_KANBAN_HOME", str(tmp_path / "live"))
+        ctx.setenv("HERMES_KANBAN_DB", str(foreign))
+        kb.init_db()  # the pinned board the parent's pin names
+        with kbc.connect() as conn:
+            kb.create_task(conn, title="real card", assignee="default")
+        before = hashlib.sha256(foreign.read_bytes()).hexdigest()
+
+        with kbc.isolated_board(probe_root) as resolved:
+            assert resolved == probe_root / "kanban.db", resolved
+            with kbc.connect() as conn:
+                kb.create_task(conn, title="probe card", assignee="default")
+                probe_rows = [r[0] for r in conn.execute("SELECT title FROM tasks")]
+
+        # The probe wrote its own board...
+        assert probe_rows == ["probe card"]
+        # ...and the pinned board is byte-identical, with only its own row.
+        assert hashlib.sha256(foreign.read_bytes()).hexdigest() == before
+        with kbc.connect() as conn:
+            assert [r[0] for r in conn.execute("SELECT title FROM tasks")] == ["real card"]
+
+        # The inherited pin is back in the process env after the helper exits, so a
+        # helper in a probe cannot silently un-pin its caller.
+        assert os.environ.get("HERMES_KANBAN_DB") == str(foreign)
+
+
+def test_isolated_board_env_refuses_a_relative_root(tmp_path):
+    from hermes_cli import kanban_db_connect as kbc
+
+    with pytest.raises(kbc.KanbanBoardPinOutsideHome):
+        kbc.isolated_board_env("relative/board")
