@@ -1199,15 +1199,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
-                #
-                # A rate-limited requeue stamps NOTHING here: the note reads as
-                # failure evidence to ``check_respawn_guard``'s blocker_auth
-                # branch, and since only a completion clears this column, one
-                # quota wall parked the card forever (#119070). The requeue
-                # stays visible on the run row (``outcome='rate_limited'``,
-                # error = the note) and the ``rate_limited`` task event.
+                # ``_record_task_failure``, yet the board UI and retry worker need
+                # the corrective message. A rate-limit requeue must NOT stamp: the
+                # note parks the card as ``blocker_auth`` until a completion (#119070).
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
