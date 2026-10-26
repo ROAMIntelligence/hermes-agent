@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- #119070 residual (t_abd07c8a): re-scopes the guard's existing pattern block + its single call site in place (+52 lines at the same chokepoint, no new facade surface); the literals are sha256-16-pinned in box rail block [99] (live), so the sibling-module move would fork the shipped form
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -57,19 +58,69 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
 # Patterns in last_failure_error that indicate a quota / auth blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
+#
 # The auth family is a curated list, not an open `auth\w*` stem: that stem
 # also matched ordinary English words like "author"/"authored"/"authoring"/
 # "authoritative" in worker progress prose, parking a healthy card forever
-# (#117009).
+# (#117009). Bare `auth` was that family's last open word — as a standalone
+# token it still matched benign worker prose (`claude auth status`) — so it is
+# gone too; every provider auth failure carries a failure word the forms below
+# match (`auth failed`, `authentication_error`, `401`).
+#
+# The boundaries are `(?<![A-Za-z])` / `(?![A-Za-z])`, not `\b`: the
+# underscores in the providers' own error codes are word characters, so the
+# \b-bounded list silently missed three of the most common walls —
+# `insufficient_quota`, `rate_limit_error`, `authentication_error` — a
+# fail-open that tests/hermes_cli/test_kanban_respawn_blocker_scope.py pins.
+# `401` was missing outright (`API Error: 401` matched nothing).
+#
+# The column also carries the board's OWN bookkeeping notes — a reclaim's
+# `stale_lock=<host>:<pid>` token, the timeout template's `elapsed Ns >
+# limit Ns` fields, every sweep line naming the worker pid — and one of those
+# must never park a card: the claim-lock token is opaque, so a worker pid of
+# `403`/`429` used to read as an HTTP status. Matching therefore runs on
+# `_respawn_blocker_text()`, which drops those spans first (t_abd07c8a). It
+# drops identifiers only: a genuine failure note that quotes a claim lock, or
+# one that carries a bookkeeping prefix, still parks.
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|"
-    r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
+    # (a) provider-diagnosis vocabulary
+    r"(?<![A-Za-z])(?:"
+    r"quota|rate[\s_\-]?limit(?:ed|s|ing)?|"
+    r"auth[\s_\-]?(?:error|fail(?:ed|ure)?|denied|invalid|expired|rejected|required)|"
+    r"authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
     r"authoris(?:e|es|ed|ing|ation)|authz|"
-    r"unauthorized|forbidden|billing|subscription|"
+    r"unauthenticated|unauthorized|forbidden|billing|subscription|"
     r"access[\s_]denied|permission[\s_]denied|"
-    r"invalid[\s_]api[\s_]key)\b",
+    r"invalid[\s_]api[\s_]key|incorrect[\s_]api[\s_]key|"
+    r"insufficient[\s_](?:balance|credits?|funds)"
+    r")(?![A-Za-z])"
+    # (b) HTTP status codes: digit-bounded, and kept out of opaque tokens by the
+    #     bookkeeping redaction below (`<host>:<pid>` is an identifier, not a
+    #     response).
+    r"|\b(?:401|403|429)\b",
     re.IGNORECASE,
 )
+
+# Board bookkeeping spans that must never be read as failure evidence: the
+# reclaim note's opaque `stale_lock=<host>:<pid>` token, the worker pid every
+# sweep note carries, and the timeout template's numeric fields. They are
+# removed from the candidate text before `_RESPAWN_BLOCKER_RE` runs.
+_RESPAWN_BOOKKEEPING_RE = re.compile(
+    r"stale_lock=\S+|pid\s+\d+|elapsed\s+\d+s\s*>\s*limit\s+\d+s",
+    re.IGNORECASE,
+)
+
+
+def _respawn_blocker_text(text: str) -> str:
+    """`text` with the board's own bookkeeping spans removed, for matching.
+
+    Only whole identifiers and template numbers are dropped — `stale_lock=…`,
+    `pid N`, `elapsed Ns > limit Ns`. Every word a provider diagnosis could
+    carry survives, so this narrows the guard without hiding a real failure.
+    """
+    return _RESPAWN_BOOKKEEPING_RE.sub(" ", text or "")
+
+
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -1588,7 +1639,9 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(
+        _respawn_blocker_text(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
