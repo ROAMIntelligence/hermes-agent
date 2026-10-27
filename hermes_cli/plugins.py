@@ -110,6 +110,12 @@ VALID_HOOKS: set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
+    # pre_user_message: once per turn, FIRST in the prologue (agent/pre_user_message.py), on turns a person
+    # typed into a surface they read (cli/tui/desktop/acp; not cron/kanban/subagent/messaging, which use
+    # pre_gateway_dispatch). Kwargs: message, session_id, platform, model, is_first_turn, parent_session_id,
+    # sender_id. Return {"action": "rewrite", "text"} -> replace the prompt the model sees and the transcript
+    # stores; anything else -> unchanged. Bounded + fail-open (a hung/raising callback never blocks the turn).
+    "pre_user_message",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
