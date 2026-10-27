@@ -96,7 +96,7 @@ async def test_push_receipt_requires_real_admission_without_displacing_user(raft
 
 @pytest.mark.asyncio
 async def test_notifier_retries_unaccepted_wake_without_repeating_pings(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_home() / "board.db"))
     runner, adapter, _source, key = setup_route()
     conn = kbc.connect()
     tids = {}
@@ -157,7 +157,7 @@ async def test_notifier_retries_unaccepted_wake_without_repeating_pings(tmp_path
 @pytest.mark.asyncio
 async def test_suppressed_ping_has_no_sent_receipt_but_wake_executes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_home() / "board.db"))
     (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: true}")
     runner, adapter, _source, key = setup_route()
     conn = kbc.connect()
