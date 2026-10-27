@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import logging
 import os
 import random
 import re
@@ -25,8 +24,6 @@ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missi
 from pathlib import Path
 from typing import Any
 from typing import Optional
-
-_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -725,11 +722,14 @@ class KanbanBoardPinOutsideHome(ValueError):
     worker it spawns, and every process that worker spawns inherits it. A guest —
     a probe, fixture or harness — that redirects its board root (``HERMES_HOME`` /
     ``HERMES_KANBAN_HOME``) to isolate itself would otherwise silently open, and on
-    a fresh file initialize, the live board the pin names (t_c7e60bbb).
+    a fresh file initialize, the live board the pin names (t_c7e60bbb). Raised by
+    :func:`connect` and :func:`init_db` when the pin wins the resolve, and by
+    :func:`isolated_board_env` / :func:`isolated_board` when an isolated board
+    escapes the root it was handed.
     """
 
 
-def _warn_foreign_board_pin(path: Path) -> None:
+def _refuse_foreign_board_pin(path: Path) -> None:
     """Fail closed on an inherited ``HERMES_KANBAN_DB`` pin outside ``kanban_home()``.
 
     Opening a pinned board is legitimate exactly while the pin belongs to the board
@@ -768,15 +768,15 @@ def _warn_foreign_board_pin(path: Path) -> None:
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(pinned):
         return
-    _log.warning(
-        "HERMES_KANBAN_DB=%s is outside this process's kanban board root (%s), so this "
-        "connection is NOT the caller's own board. The pin is injected into dispatcher "
-        "workers and inherited by everything they spawn, which is how a guest that "
-        "moved its board root (HERMES_HOME / HERMES_KANBAN_HOME) to isolate itself "
-        "ends up writing another tree's live board. Drop the inherited pin, or build a "
-        "probe env with isolated_board_env(); set HERMES_KANBAN_HOME=%s to adopt that "
-        "board on purpose.",
-        pinned, home, pinned.parent,
+    raise KanbanBoardPinOutsideHome(
+        f"HERMES_KANBAN_DB={pinned} is outside this process's kanban board root "
+        f"({home}), so this connection is NOT the caller's own board. The pin is "
+        "injected into dispatcher workers and inherited by everything they spawn, "
+        "which is how a guest that moved its board root (HERMES_HOME / "
+        "HERMES_KANBAN_HOME) to isolate itself ends up writing another tree's live "
+        "board. Drop the inherited pin, or build a probe env with "
+        f"isolated_board_env(); set HERMES_KANBAN_HOME={pinned.parent} to adopt "
+        "that board on purpose."
     )
 
 # The env vars a dispatcher exports into a worker and everything downstream
@@ -800,7 +800,10 @@ def _assert_board_under(path: Path, root: Path) -> None:
 
 
 def _resolve_under(env: Mapping[str, str]) -> Path:
-    """``kanban_db_path()`` as *env* would resolve it (applied, then restored)."""
+    """``kanban_db_path()`` as *env* would resolve it (applied, then restored).
+
+    Flips process-global board env for the call, so it is main-thread only for
+    the same reason as :func:`isolated_board`."""
     saved = {key: os.environ.get(key) for key in _BOARD_PIN_ENV}
     try:
         for key in _BOARD_PIN_ENV:
@@ -853,10 +856,20 @@ def isolated_board(root: str | os.PathLike[str]):
     path is proved to sit under *root*, and anything else raises
     :class:`KanbanBoardPinOutsideHome` instead of quietly handing back another
     tree's live board.
+
+    Moves process-global ``os.environ`` for the duration, so it is single-thread
+    only: calling it off the main thread raises :class:`RuntimeError` — build a
+    child env with :func:`isolated_board_env` instead, which never touches this
+    process.
     """
     root = Path(root).expanduser()
     if not root.is_absolute():
         raise KanbanBoardPinOutsideHome(f"isolated board root must be absolute: {root}")
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError(
+            "isolated_board() moves process-global board env and is main-thread only; "
+            "build a child env with isolated_board_env() instead"
+        )
     saved = {key: os.environ.get(key) for key in _BOARD_PIN_ENV}
     for key in _BOARD_PIN_ENV:
         os.environ.pop(key, None)
@@ -881,12 +894,12 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     ``<root>/kanban/current`` -> ``default``). An explicit ``db_path`` is always
     authoritative; a path that came from the ``HERMES_KANBAN_DB`` pin is refused when
     that pin lies outside this process's own board root (see
-    :func:`_warn_foreign_board_pin`)."""
+    :func:`_refuse_foreign_board_pin`)."""
     if db_path is not None:
         path = db_path
     else:
         path = _kb.kanban_db_path(board=board)
-        _warn_foreign_board_pin(path)
+        _refuse_foreign_board_pin(path)
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
@@ -974,7 +987,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     if db_path is None:
-        _warn_foreign_board_pin(path)
+        _refuse_foreign_board_pin(path)
     _refuse_dead_board_resurrection(path, board)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.

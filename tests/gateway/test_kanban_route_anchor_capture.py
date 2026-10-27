@@ -31,7 +31,7 @@ def test_slash_subscription_keeps_the_routed_source_owner(tmp_path, monkeypatch)
     from gateway.platforms.event import MessageEvent
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
 
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_home() / "kanban.db"))
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._kanban_notifier_profile = "default"
     source = SessionSource(platform=Platform.DISCORD, chat_id="post", chat_type="thread",

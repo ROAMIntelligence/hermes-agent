@@ -70,7 +70,10 @@ def _create_completed_task(*, subscribe: bool) -> str:
 
 def test_zero_sub_board_is_never_opened_writable(tmp_path, monkeypatch):
     """A board with zero subscriptions must be skipped BEFORE `_kb.connect`."""
-    db_path = tmp_path / "zero-subs.db"
+    # A dispatcher/notifier pin always sits under the board root of the process that
+    # carries it (`kanban_db_path()` derives it), so model that shape: an out-of-root
+    # pin is refused outright (t_c7e60bbb).
+    db_path = kb.kanban_home() / "zero-subs.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
     _create_completed_task(subscribe=False)

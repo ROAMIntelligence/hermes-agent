@@ -254,7 +254,10 @@ def test_notifier_seam_connect_lands_on_pinned_db(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    pinned = tmp_path / "board.db"
+    # The dispatcher derives the pin from the same resolver it uses for the board
+    # root, so a real pin always sits under that root (`<root>/kanban.db`) — an
+    # out-of-root pin is refused outright (t_c7e60bbb).
+    pinned = home / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     kb.init_db()
     with kbc.connect() as conn:  # what the dispatcher/notifier box writes
@@ -280,10 +283,10 @@ def test_notifier_seam_connect_lands_on_pinned_db(monkeypatch, tmp_path):
 # are the supported way to ask for a throwaway board.
 # ---------------------------------------------------------------------------
 
-def test_inherited_pin_outside_the_process_root_warns_loudly(monkeypatch, tmp_path, caplog):
+def test_inherited_pin_outside_the_process_root_is_refused(monkeypatch, tmp_path):
     """The reported shape: HERMES_HOME moved to a scratch root, inherited pin still
-    pointing at another tree's board. connect() must not be silent about landing on
-    a board that is not the caller's own."""
+    pointing at another tree's board. connect() refuses loudly instead of opening —
+    and initializing — a board that is not the caller's own."""
     from hermes_cli import kanban_db_connect as kbc
 
     probe_home = tmp_path / "probe-home"
@@ -292,13 +295,16 @@ def test_inherited_pin_outside_the_process_root_warns_loudly(monkeypatch, tmp_pa
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(probe_home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign))  # inherited dispatcher pin
 
-    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db_connect"):
-        with kbc.connect() as conn:
-            resolved = conn.execute("PRAGMA database_list").fetchone()[2]
+    with pytest.raises(kbc.KanbanBoardPinOutsideHome, match="HERMES_KANBAN_DB"):
+        kbc.connect()
+    assert not foreign.exists(), "the refused pin's board was created anyway"
 
-    assert resolved == str(foreign), resolved
-    assert "HERMES_KANBAN_DB" in caplog.text, caplog.text
-    assert str(foreign) in caplog.text, caplog.text
+    # Dropping the inherited pin is the whole isolation step: the probe's own board
+    # then opens under its own root, and the live board is never touched.
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    with kbc.connect() as conn:
+        resolved = conn.execute("PRAGMA database_list").fetchone()[2]
+    assert resolved == str(probe_home / "kanban.db"), resolved
 
 
 def test_pin_under_the_process_root_is_quiet(monkeypatch, tmp_path, caplog):
