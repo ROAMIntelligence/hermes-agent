@@ -244,6 +244,69 @@ from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_g
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 
 
+# ``gateway.platforms.base`` derives its cache and media-delivery allowlist roots from the home at
+# IMPORT time (``IMAGE_CACHE_DIR``..``SCREENSHOT_CACHE_DIR``, ``_HERMES_HOME``, ``_HERMES_ROOT``,
+# ``MEDIA_DELIVERY_SAFE_ROOTS``). A test module or ancestor conftest imported during collection —
+# ``tests/e2e/conftest.py``, ``tests/gateway/test_platform_base.py`` — runs BEFORE the per-test
+# sandbox, so those constants freeze the operator's real home. Any later media-delivery validation
+# then resolves a real-home allow root, the home-I/O guard correctly refuses it, and the test sees
+# a failure (or, where the refusal is swallowed, silently empty uploads). Re-derive the constants
+# for this test's home so a collection-time import behaves like a post-sandbox one.
+_PLATFORM_BASE_CACHE_DIR_SPECS = (
+    ("IMAGE_CACHE_DIR", "cache/images", "image_cache"),
+    ("AUDIO_CACHE_DIR", "cache/audio", "audio_cache"),
+    ("VIDEO_CACHE_DIR", "cache/videos", "video_cache"),
+    ("DOCUMENT_CACHE_DIR", "cache/documents", "document_cache"),
+    ("SCREENSHOT_CACHE_DIR", "cache/screenshots", "browser_screenshots"),
+)
+
+
+def _repin_platform_base_home_roots(monkeypatch) -> None:
+    """Point ``gateway.platforms.base``'s import-time home roots at this test's sandbox home."""
+    module = sys.modules.get("gateway.platforms.base")
+    if module is None:
+        return
+    import hermes_constants
+
+    new_home = hermes_constants.get_hermes_home()
+    old_home = getattr(module, "_HERMES_HOME", None)
+    if old_home is not None and Path(old_home) == Path(new_home):
+        return  # imported after the sandbox: the frozen values are already correct
+    remap: dict[Path, Path] = {}
+    for attr, subpath, legacy in _PLATFORM_BASE_CACHE_DIR_SPECS:
+        if not hasattr(module, attr):
+            continue
+        old_value = Path(getattr(module, attr))
+        new_value = hermes_constants.get_hermes_dir(subpath, legacy)
+        remap[old_value] = new_value
+        monkeypatch.setattr(module, attr, new_value)
+    if hasattr(module, "_CACHE_DIR_IMPORT_DEFAULTS"):
+        monkeypatch.setattr(
+            module, "_CACHE_DIR_IMPORT_DEFAULTS",
+            {attr: getattr(module, attr) for attr, _, _ in _PLATFORM_BASE_CACHE_DIR_SPECS
+             if hasattr(module, attr)})
+    if hasattr(module, "_HERMES_HOME"):
+        monkeypatch.setattr(module, "_HERMES_HOME", new_home)
+    if hasattr(module, "_HERMES_ROOT"):
+        monkeypatch.setattr(module, "_HERMES_ROOT", hermes_constants.get_default_hermes_root())
+    if hasattr(module, "MEDIA_DELIVERY_SAFE_ROOTS"):
+        # Translate every frozen allow root instead of restating the module's construction, so a
+        # product-side addition to the tuple is carried over rather than silently dropped.
+        def _translated(root: Path) -> Path:
+            root = Path(root)
+            if root in remap:
+                return remap[root]
+            if old_home is None:
+                return root
+            try:
+                return Path(new_home) / root.relative_to(old_home)
+            except ValueError:
+                return root
+
+        monkeypatch.setattr(module, "MEDIA_DELIVERY_SAFE_ROOTS",
+                            tuple(_translated(root) for root in module.MEDIA_DELIVERY_SAFE_ROOTS))
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
@@ -348,6 +411,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
         monkeypatch.setattr(
             hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
         )
+
+    # 3d. Same collection-time-import hazard for gateway.platforms.base, which freezes its cache
+    #     and media-delivery allowlist roots at import (see _repin_platform_base_home_roots).
+    #     Left stale, a media-delivery validation resolves a real-home allow root, the home-I/O
+    #     guard refuses it, and the test reports a failure — or, where the refusal is swallowed
+    #     by best-effort delivery, silently empty uploads.
+    _repin_platform_base_home_roots(monkeypatch)
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
