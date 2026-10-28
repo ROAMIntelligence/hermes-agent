@@ -202,3 +202,55 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_collection_time_platform_import_keeps_media_roots_in_the_sandbox(tmp_path):
+    """``gateway.platforms.base`` freezes its cache/media-delivery allowlist roots at import, and a
+    module imported during collection — ``tests/e2e/conftest.py``, ``tests/gateway/test_platform_base.py``
+    — runs BEFORE the per-test sandbox. On a shell whose HERMES_HOME is the real home (a lane shell
+    exporting ``<root>/profiles/<name>``, a developer shell exporting ``~/.hermes``) the frozen roots
+    name that home, so a later media-delivery validation resolves it and the home-I/O guard correctly
+    refuses: 22 reds in ``tests/gateway/test_platform_base.py``, and silently empty kanban artifact
+    uploads whenever ``tests/e2e/`` is co-collected. The sandbox fixture re-derives them."""
+    protected = tmp_path / "protected-home"
+    (protected / "cache" / "images").mkdir(parents=True)
+    probe = tmp_path / "test_probe.py"
+    probe.write_text(textwrap.dedent("""
+        import os
+        from pathlib import Path
+
+        import pytest
+
+        # Collection-time import: exactly what an ancestor conftest or a test module does.
+        import gateway.platforms.base as base
+
+        PROTECTED = Path("@PROTECTED@").resolve()
+
+        def test_media_roots_follow_the_sandbox_home():
+            from hermes_constants import get_hermes_home
+            home = Path(get_hermes_home()).resolve()
+            assert home != PROTECTED, "the sandbox did not move HERMES_HOME"
+            # The guard must be armed, or the assertions below prove nothing.
+            with pytest.raises(AssertionError):
+                (PROTECTED / "cache" / "images").resolve()
+            roots = [Path(root) for root in base.MEDIA_DELIVERY_SAFE_ROOTS]
+            leaked = [str(root) for root in roots
+                      if root == PROTECTED or root.is_relative_to(PROTECTED)]
+            assert not leaked, f"stale media allow roots under the real home: {leaked}"
+            # Strict mode makes acceptance depend on the allowlist itself.
+            os.environ["HERMES_MEDIA_DELIVERY_STRICT"] = "1"
+            os.environ["HERMES_MEDIA_TRUST_RECENT_FILES"] = "0"
+            artifact = home / "cache" / "images" / "artifact.png"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(b"png")
+            assert base.validate_media_delivery_path(str(artifact)) == str(artifact)
+        """).replace("@PROTECTED@", str(protected)), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("HERMES_HOME", "HERMES_TEST_SANDBOX_HOME")}
+    env["HERMES_HOME"] = str(protected)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "tests.conftest", "-p", "no:cacheprovider", "-q", str(probe)],
+        cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
