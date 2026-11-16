@@ -17,7 +17,11 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER, exit_single_query
+from hermes_cli.quiet_single_query import (
+    KANBAN_WORKER_EXIT_REASON_MARKER,
+    KANBAN_WORKER_EXIT_TRAILER,
+    exit_single_query,
+)
 
 
 @pytest.fixture
@@ -33,8 +37,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
-    """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
+def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, reason=None) -> None:
+    """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here.
+    ``reason`` is the provider reason the worker appended to its exit trailer (None = bare trailer)."""
     host = kb._claimer_id().split(":", 1)[0]
     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
     conn.execute(
@@ -44,21 +49,23 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
     conn.commit()
     log = kb.worker_log_path(tid)
     log.parent.mkdir(parents=True, exist_ok=True)
+    suffix = f"{KANBAN_WORKER_EXIT_REASON_MARKER}{reason}" if reason else ""
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
+        f.write("the model said something\n\nResume this session with:\n  hermes --resume x\n\n"
+                f"{KANBAN_WORKER_EXIT_TRAILER}{rc}{suffix}\n")
 
 
 @pytest.mark.parametrize(
-    "rc, event, failure_counted",
-    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False)],
+    "rc, reason, event, failure_counted",
+    [(0, None, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limit", "rate_limited", False)],
 )
-def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, failure_counted):
+def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, reason, event, failure_counted):
     """Empty reap registry + exit trailer in the log: a clean exit is the protocol violation
-    (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue — not a bare
-    ``pid N not alive`` crash that counts a failure."""
+    (marker, streak, no unified-budget hit) and a 75 carrying the worker's provider reason is a
+    rate-limit requeue — not a bare ``pid N not alive`` crash that counts a failure."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="a")
-        _dead_worker_with_log(conn, tid, 70001, rc)
+        _dead_worker_with_log(conn, tid, 70001, rc, reason=reason)
 
         kbd.detect_crashed_workers(conn)
 
@@ -81,6 +88,36 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
             assert KANBAN_WORKER_EXIT_TRAILER not in (run["error"] or "")
         else:
             assert run["outcome"] == "rate_limited"
+
+
+@pytest.mark.parametrize("earlier_reasons", [(), ("rate_limit",)])
+def test_fresh_process_sweep_bare_75_is_charged(kanban_home, earlier_reasons):
+    """A 75 whose trailer names no provider reason is EX_TEMPFAIL from something other than the
+    throttle classifier: a charged crash, so the breaker can see it. The LAST trailer decides — an
+    earlier run's marked 75 still in the append-mode log is no evidence for this one."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        for i, reason in enumerate(earlier_reasons):
+            _dead_worker_with_log(conn, tid, 70100 + i, kb.KANBAN_RATE_LIMIT_EXIT_CODE, reason=reason)
+            kbd.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+
+        _dead_worker_with_log(conn, tid, 70199, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        crashed = kbd.detect_crashed_workers(conn)
+
+        ev = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        task = kb.get_task(conn, tid)
+        assert ev["kind"] == "crashed"
+        assert run["outcome"] == "crashed"
+        assert tid in crashed and tid not in kbd.detect_crashed_workers._last_rate_limited
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        meta = kb._json_dict(run["metadata"])
+        assert meta.get("exit_code") == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        assert meta.get("no_throttle_evidence") is True
 
 
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
