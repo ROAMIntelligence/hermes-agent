@@ -319,6 +319,138 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+def _append_worker_log(tid: str, text: str) -> None:
+    """Append ``text`` to the task's worker log, as the worker's stdout/stderr would."""
+    log = kb.worker_log_path(tid)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _reap_dead_75(conn, tid: str, pid: int, log_text=None) -> list[str]:
+    """Claim ``tid`` for a worker the reap registry saw exit 75, optionally leave
+    ``log_text`` in its log, and run one dead-worker sweep."""
+    host = kb._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    conn.commit()
+    kbd._record_worker_exit(pid, _exited_status(kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+    if log_text is not None:
+        _append_worker_log(tid, log_text)
+    return kbd.detect_crashed_workers(conn)
+
+
+def _assert_charged_75(conn, tid: str, crashed: list[str]) -> None:
+    """The dead 75 was booked as an ordinary crash: run ``crashed``, one failure
+    counted, no quota requeue and no ``rate_limited`` event."""
+    assert tid in crashed
+    assert tid not in getattr(kbd.detect_crashed_workers, "_last_rate_limited", [])
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.consecutive_failures == 1
+    assert "no provider-throttle evidence" in (task.last_failure_error or "")
+    run = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,),
+    ).fetchone()
+    assert run["outcome"] == "crashed"
+    assert kb._json_dict(run["metadata"]).get("exit_code") == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert not conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='rate_limited'", (tid,),
+    ).fetchone()
+
+
+def test_bare_75_without_throttle_evidence_is_charged_failure(kanban_home, monkeypatch):
+    """75 is BSD EX_TEMPFAIL, the repo-wide generic transient code: a 75 whose
+    worker left no provider-throttle reason (here: no log at all) is booked as a
+    charged crash, so a non-throttle producer cannot respawn a card unbounded."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tempfail", assignee="a")
+        _assert_charged_75(conn, tid, _reap_dead_75(conn, tid, 73000))
+
+
+def test_75_with_non_throttle_reason_is_charged_failure(kanban_home, monkeypatch):
+    """The gate is an allowlist, not "any marker": a trailer reason outside the
+    worker's throttle classification is no evidence either."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tempfail", assignee="a")
+        crashed = _reap_dead_75(conn, tid, 73001, "\n[kanban-worker-exit] rc=75 reason=owner_admission\n")
+        _assert_charged_75(conn, tid, crashed)
+
+
+def test_rate_limit_refunds_are_capped_per_card(kanban_home, monkeypatch):
+    """Genuine throttle evidence buys at most ``RATE_LIMIT_MAX_REFUNDS`` neutral
+    requeues while the card makes no progress; every later 75 is charged, so the
+    breaker trips at the failure limit instead of the card looping."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kbd, "RATE_LIMIT_MAX_REFUNDS", 2)
+    monkeypatch.setattr(kbd, "DEFAULT_FAILURE_LIMIT", 2)  # the trip below lands on attempt 4
+
+    marked = "\n[kanban-worker-exit] rc=75 reason=rate_limit\n"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="capped", assignee="a")
+        seen = []
+        for attempt in range(1, 5):
+            crashed = _reap_dead_75(conn, tid, 74000 + attempt, marked)
+            task = kb.get_task(conn, tid)
+            rate_limited = getattr(kbd.detect_crashed_workers, "_last_rate_limited", [])
+            seen.append((attempt, task.status, task.consecutive_failures,
+                         tid in rate_limited, tid in crashed))
+
+        assert seen == [
+            (1, "ready", 0, True, False),
+            (2, "ready", 0, True, False),
+            (3, "ready", 1, False, True),
+            (4, "blocked", 2, False, True),
+        ]
+        runs = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()
+        assert [r["outcome"] for r in runs] == ["rate_limited", "rate_limited", "crashed", "crashed"]
+        for r in runs[2:]:
+            meta = kb._json_dict(r["metadata"])
+            assert meta.get("exit_kind") == "rate_limited_capped"
+            assert meta.get("rate_limit_refunds") == 2
+        # A charged death is booked as a crash on the event log too, never as a quota requeue.
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind IN ('rate_limited', 'crashed') "
+            "ORDER BY id", (tid,),
+        ).fetchall()]
+        assert kinds == ["rate_limited", "rate_limited", "crashed", "crashed"]
+        assert "refund cap (2) spent" in (kb.get_task(conn, tid).last_failure_error or "")
+
+
+def test_rate_limit_refund_count_resets_only_on_progress(kanban_home):
+    """The refund count walks back to the card's last real handoff
+    (``completed`` / ``review_requested``); a charged crash in between does not
+    reset it, or the refund loop the cap closes would reopen."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="history", assignee="a")
+        assert kbd._rate_limit_refunds(conn, tid) == 0
+
+        def runs(*outcomes):
+            now = int(time.time())
+            conn.executemany(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(tid, o, o, now, now) for o in outcomes],
+            )
+            conn.commit()
+
+        runs("rate_limited", "rate_limited", "completed")
+        assert kbd._rate_limit_refunds(conn, tid) == 0
+        runs("rate_limited", "crashed", "rate_limited", "timed_out")
+        assert kbd._rate_limit_refunds(conn, tid) == 2
+        runs("review_requested", "rate_limited")
+        assert kbd._rate_limit_refunds(conn, tid) == 1
+
+
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
@@ -326,7 +458,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 ):
     """A rate-limit sentinel exit releases the task to ``ready`` and leaves
     ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    transient throttle, even across many quota-wall hits (every refund the
+    per-card cap allows)."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -337,9 +470,11 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
+        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2) —
+        # all of them inside the refund cap, so none may count a failure.
         # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
+        assert _kbd.RATE_LIMIT_MAX_REFUNDS > _kbd.DEFAULT_FAILURE_LIMIT
+        for i in range(_kbd.RATE_LIMIT_MAX_REFUNDS):
             pid = 70000 + i
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
@@ -354,6 +489,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             _kbd._record_worker_exit(
                 pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
             )
+            # The worker's own throttle classification, written to its log
+            # by ``exit_single_query`` — the evidence a refund requires.
+            _append_worker_log(tid, "\n[kanban-worker-exit] rc=75 reason=rate_limit\n")
 
             crashed = kbd.detect_crashed_workers(conn)
             # Rate-limited requeues are NOT crashes.

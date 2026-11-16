@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -32,11 +33,46 @@ KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
 def exit_single_query(code: int) -> None:
     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        with contextlib.suppress(Exception):
-            # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
-            # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+    _write_worker_exit_trailer(code)
+    sys.exit(code)
+
+
+# Optional trailer suffix ``reason=<name>``: the worker's OWN classification of why it exits. 75 is
+# BSD EX_TEMPFAIL, the repo-wide generic transient code, so the sweep refunds a 75 as a provider
+# rate-limit requeue only when the throttle classifier wrote its reason here; a bare 75 is charged.
+#
+# Kept BELOW ``exit_single_query`` on purpose: the fleet's live patch lane splices this module at an
+# exact text anchor spanning ``KANBAN_WORKER_EXIT_TRAILER`` .. ``def exit_single_query(code: int) -> None:``,
+# and a rail whose anchor matches zero times refuses every patch in the run.
+KANBAN_WORKER_EXIT_REASON_MARKER = " reason="
+_EXIT_REASON_UNSAFE = re.compile(r"[^a-z0-9_]")
+
+
+def _write_worker_exit_trailer(code: int, reason: str | None = None) -> None:
+    """Append the ``[kanban-worker-exit] rc=<code> reason=<name>`` trailer to stderr; writes nothing else.
+
+    ``reason`` comes only from a caller's own classification of this exit (the provider-throttle
+    classifier, beside its 75): sanitized to ``[a-z0-9_]`` and appended after
+    ``KANBAN_WORKER_EXIT_REASON_MARKER``. A caller that does not know why it exits passes none, and
+    its trailer stays byte-identical to the bare ``rc=<code>`` line.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    with contextlib.suppress(Exception):
+        clean = _EXIT_REASON_UNSAFE.sub("", str(reason).lower()) if reason else ""
+        suffix = f"{KANBAN_WORKER_EXIT_REASON_MARKER}{clean}" if clean else ""
+        # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
+        # captures both streams.
+        print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}{suffix}", file=sys.stderr, flush=True)
+
+
+def exit_single_query_with_reason(code: int, reason: str | None = None) -> None:
+    """``exit_single_query`` for a caller that knows WHY it exits: name the reason in the trailer.
+
+    Same contract as ``exit_single_query``; this only adds the ``reason=<name>`` suffix the dispatcher
+    requires before it refunds a 75 as a provider throttle instead of charging it as a death.
+    """
+    _write_worker_exit_trailer(code, reason)
     sys.exit(code)
 
 

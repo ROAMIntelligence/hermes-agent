@@ -44,13 +44,19 @@ def _run_non_quiet(monkeypatch, turn_result):
     return None
 
 
+def _exit_trailer_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if ln.startswith("[kanban-worker-exit] ")]
+
+
 @pytest.mark.parametrize(
     "reason", ["rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout"]
 )
-def test_dispatcher_spawned_worker_signals_a_provider_outage_not_a_protocol_violation(monkeypatch, reason):
+def test_dispatcher_spawned_worker_signals_a_provider_outage_not_a_protocol_violation(monkeypatch, capsys, reason):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
     code = _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": reason})
     assert code == KANBAN_RATE_LIMIT_EXIT_CODE
+    # The 75 carries its own provider reason: the dispatcher refunds a 75 only on this evidence.
+    assert _exit_trailer_lines(capsys.readouterr().err) == [f"[kanban-worker-exit] rc=75 reason={reason}"]
 
 
 @pytest.mark.parametrize(
@@ -88,10 +94,15 @@ def test_a_plain_one_shot_run_reports_its_outcome(monkeypatch, turn_result, expe
     assert _run_non_quiet(monkeypatch, turn_result) == expected
 
 
-@pytest.mark.parametrize(("rate_limited", "expected"), [(True, KANBAN_RATE_LIMIT_EXIT_CODE), (False, 1)])
-def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(monkeypatch, rate_limited, expected):
-    """A 429 at startup never produces a turn result; the worker must still exit 75 (#117482).
-    A real credential failure keeps exit 1."""
+@pytest.mark.parametrize(
+    ("rate_limited", "expected", "trailer"),
+    [(True, KANBAN_RATE_LIMIT_EXIT_CODE, "[kanban-worker-exit] rc=75 reason=credentials_rate_limited"),
+     (False, 1, "[kanban-worker-exit] rc=1")],
+)
+def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(
+        monkeypatch, capsys, rate_limited, expected, trailer):
+    """A 429 at startup never produces a turn result; the worker must still exit 75 (#117482),
+    naming the wall in its exit trailer. A real credential failure keeps exit 1, with no reason."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
     monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
     monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, []))
@@ -107,3 +118,104 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+    assert _exit_trailer_lines(capsys.readouterr().err) == [trailer]
+
+
+@pytest.mark.parametrize(
+    ("kanban", "result", "credentials_rate_limited", "expected"),
+    [
+        (True, {"failed": True, "failure_reason": "rate_limit"}, False, (KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limit")),
+        (True, {"failed": True, "failure_reason": "auth"}, False, (KANBAN_TERMINAL_PROVIDER_EXIT_CODE, None)),
+        (True, None, True, (KANBAN_RATE_LIMIT_EXIT_CODE, "credentials_rate_limited")),
+        (True, {"failed": True}, False, (1, None)),
+        (False, {"failed": True, "failure_reason": "rate_limit"}, False, (1, None)),
+        (False, None, True, (1, None)),
+    ],
+)
+def test_single_query_exit_pairs_a_throttle_code_with_its_reason(
+        monkeypatch, kanban, result, credentials_rate_limited, expected):
+    """The classifier's reason is the durable half of a 75: only a Kanban worker's provider wall
+    has one. ``_single_query_exit_code`` stays the code half of the same decision."""
+    from hermes_cli.cli_single_query import _single_query_exit, _single_query_exit_code
+
+    if kanban:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    assert _single_query_exit(result, credentials_rate_limited=credentials_rate_limited) == expected
+    assert _single_query_exit_code(result, credentials_rate_limited=credentials_rate_limited) == expected[0]
+
+
+@pytest.mark.parametrize(
+    ("result", "credentials_rate_limited"),
+    [*[({"failed": True, "failure_reason": r}, False)
+       for r in ("rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout")],
+     (None, True)],
+)
+def test_every_reason_a_worker_writes_is_evidence_the_sweep_accepts(monkeypatch, result, credentials_rate_limited):
+    """Producer and dispatcher share one allowlist: a reason the worker attaches to its 75 must be
+    one the dead-worker sweep accepts as throttle evidence, or a real quota wall gets charged."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.cli_single_query import _single_query_exit
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    code, reason = _single_query_exit(result, credentials_rate_limited=credentials_rate_limited)
+    assert code == KANBAN_RATE_LIMIT_EXIT_CODE
+    assert kbd._rate_limit_evidence(reason) is True
+
+
+@pytest.mark.parametrize(
+    ("reason", "trailer"),
+    [
+        ("rate_limit", "[kanban-worker-exit] rc=75 reason=rate_limit"),
+        ("Rate-Limit!", "[kanban-worker-exit] rc=75 reason=ratelimit"),  # sanitized to [a-z0-9_]
+        ("--", "[kanban-worker-exit] rc=75"),  # nothing left after sanitizing: bare trailer
+        (None, "[kanban-worker-exit] rc=75"),
+    ],
+)
+def test_exit_trailer_carries_a_reason_only_when_one_is_given(monkeypatch, capsys, reason, trailer):
+    from hermes_cli.quiet_single_query import exit_single_query_with_reason
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    with pytest.raises(SystemExit) as exc:
+        exit_single_query_with_reason(KANBAN_RATE_LIMIT_EXIT_CODE, reason=reason)
+    assert exc.value.code == KANBAN_RATE_LIMIT_EXIT_CODE
+    assert _exit_trailer_lines(capsys.readouterr().err) == [trailer]
+
+
+def test_a_bare_exit_trailer_is_unchanged_for_callers_that_pass_no_reason(monkeypatch, capsys):
+    from hermes_cli.quiet_single_query import exit_single_query
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    with pytest.raises(SystemExit):
+        exit_single_query(KANBAN_RATE_LIMIT_EXIT_CODE)
+    (line,) = _exit_trailer_lines(capsys.readouterr().err)
+    assert line == "[kanban-worker-exit] rc=75" and " reason=" not in line
+
+
+class _RewritingEmitter:
+    """A stream-json emitter whose result record reports a different exit code than it was handed."""
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+    def emit_result(self, result, session_id="", exit_code=0):
+        return self.code
+
+
+@pytest.mark.parametrize(
+    ("emitter", "expected", "trailer"),
+    [(None, KANBAN_RATE_LIMIT_EXIT_CODE, "[kanban-worker-exit] rc=75 reason=rate_limit"),
+     (_RewritingEmitter(1), 1, "[kanban-worker-exit] rc=1")],
+)
+def test_quiet_worker_writes_the_reason_of_the_code_it_exits_with(monkeypatch, capsys, emitter, expected, trailer):
+    """``-Q`` path: the provider reason rides only the 75 it was classified with — an emitter that
+    rewrites the exit code drops it, so a non-75 exit never carries throttle evidence."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    agent = SimpleNamespace(
+        run_conversation=lambda **kw: {"failed": True, "failure_reason": "rate_limit", "error": "HTTP 429"},
+        session_id="s-1",
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(
+            SimpleNamespace(agent=agent, conversation_history=[], session_id="s-1"), "hello", emitter=emitter)
+    assert exc.value.code == expected
+    assert _exit_trailer_lines(capsys.readouterr().err) == [trailer]

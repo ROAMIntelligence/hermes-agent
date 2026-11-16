@@ -15,7 +15,7 @@ import time
 from agent.interrupt_compat import request_hard_interrupt
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cli")
@@ -125,8 +125,13 @@ def _sync_cli_session_id_from_agent(cli) -> None:
 # ``failure_reason`` values that say nothing about the task itself: the provider is walled,
 # down or unreachable, or the account is out of credit, so a Kanban worker signals "try
 # later" instead of "I failed" and the dispatcher does not spend the task's retry budget on it.
+# The set is also the dispatcher's allowlist of throttle evidence: a worker's 75 is refunded only
+# when its exit trailer names one of these (``kanban_db_dispatch._rate_limit_evidence``), so
+# ``credentials_rate_limited`` — the quota AuthError at credential resolution, which has no turn
+# result and so no ``failure_reason`` — is listed under the name the worker writes for it.
 _TRANSIENT_PROVIDER_REASONS = frozenset({
     "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",
+    "credentials_rate_limited",
 })
 
 
@@ -156,25 +161,48 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -
     error (credential revoked, model gone) exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``
     (EX_CONFIG): the dispatcher blocks the card at once.
     """
+    return _single_query_exit(result, credentials_rate_limited=credentials_rate_limited)[0]
+
+
+def _single_query_exit(result, *, credentials_rate_limited: bool = False) -> "tuple[int, Optional[str]]":
+    """(exit code, provider reason). The reason is the durable half: the dispatcher books a 75
+    neutrally ONLY when the worker wrote it into its exit trailer.
+
+    Same decision as ``_single_query_exit_code``; only the provider walls behind a
+    ``KANBAN_RATE_LIMIT_EXIT_CODE`` carry a reason, always a member of ``_TRANSIENT_PROVIDER_REASONS``.
+    """
     from cli import _TERMINAL_PROVIDER_REASONS, _TRANSIENT_PROVIDER_REASONS
     if not isinstance(result, dict):
         if credentials_rate_limited and os.environ.get("HERMES_KANBAN_TASK"):
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
-            return KANBAN_RATE_LIMIT_EXIT_CODE
-        return 1
+            return KANBAN_RATE_LIMIT_EXIT_CODE, "credentials_rate_limited"
+        return 1, None
     if result.get("interrupted"):
-        return 130
+        return 130, None
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
-        return 0
+        return 0, None
     if os.environ.get("HERMES_KANBAN_TASK"):
         reason = result.get("failure_reason")
         if reason in _TRANSIENT_PROVIDER_REASONS:
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
-            return KANBAN_RATE_LIMIT_EXIT_CODE
+            return KANBAN_RATE_LIMIT_EXIT_CODE, reason
         if reason in _TERMINAL_PROVIDER_REASONS:
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
-            return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
-    return 1
+            return KANBAN_TERMINAL_PROVIDER_EXIT_CODE, None
+    return 1, None
+
+
+def _exit_worker(exit_code: int, reason: "Optional[str]" = None):
+    """End the process through the worker exit trailer, naming the provider reason when one exists.
+
+    ``reason`` is the dispatcher's evidence that a 75 is a provider throttle (the only booking that is
+    refunded without counting a failure), so it is passed through whenever the classifier produced one;
+    everything else exits on the bare trailer.
+    """
+    from hermes_cli.quiet_single_query import exit_single_query, exit_single_query_with_reason
+    if reason:
+        exit_single_query_with_reason(exit_code, reason)
+    exit_single_query(exit_code)
 
 
 def _run_quiet_single_query(cli, effective_query, emitter=None):
@@ -283,10 +311,13 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    _exit_code = _single_query_exit_code(result)
+    _exit_code, _exit_reason = _single_query_exit(result)
     if emitter is not None:
-        _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
-    exit_single_query(_exit_code)
+        _emitted = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
+        if _emitted != _exit_code:
+            # The reason is evidence for the 75 it was classified with, never for another code.
+            _exit_code, _exit_reason = _emitted, None
+    _exit_worker(_exit_code, _exit_reason)
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):
@@ -433,7 +464,7 @@ def _configure_quiet_agent(agent) -> None:
 def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool = False):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
     ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
-    from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive, _single_query_exit_code
+    from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(
@@ -494,12 +525,14 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                         emitter.attach(cli.agent)
                     _run_quiet_single_query(cli, effective_query, emitter=emitter)
 
-            fail_code = _single_query_exit_code(
+            fail_code, fail_reason = _single_query_exit(
                 None, credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False))
             if emitter is not None:
-                emitter.emit_result({"failed": True, "error": "credentials or agent init failed"},
-                                    session_id=cli.session_id or "", exit_code=fail_code)
-            exit_single_query(fail_code)  # credentials or agent init failed
+                emitted = emitter.emit_result({"failed": True, "error": "credentials or agent init failed"},
+                                              session_id=cli.session_id or "", exit_code=fail_code)
+                if emitted != fail_code:
+                    fail_code, fail_reason = emitted, None
+            _exit_worker(fail_code, fail_reason)  # credentials or agent init failed
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
         if _query_label:
@@ -517,6 +550,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(cli._last_turn_result))
+        _exit_code, _exit_reason = _single_query_exit(cli._last_turn_result)
+        _exit_worker(_exit_code, _exit_reason)
     finally:
         _finalize_single_query(cli)

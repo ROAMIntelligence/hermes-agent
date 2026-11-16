@@ -26,6 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_REASON_MARKER
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -78,6 +79,16 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Neutral rate-limit requeues a card may take while it makes no progress (no
+# ``completed`` / ``review_requested`` run since); the next evidenced 75 is charged
+# like any crash, so the breaker trips at ``DEFAULT_FAILURE_LIMIT`` instead of a
+# card looping on the cooldown for hours. Measured on the fleet board (2026-11-16,
+# every card's longest window of refunds <= 15 min apart since its last progress):
+# windows of 1/2/3 refunds on 56/42/16 cards, then none at 4, one at 5, none at 6,
+# and the multi-hour-outage tail from 7 up to 203. 6 sits inside that empty band,
+# so every ordinary quota window still refunds untouched.
+RATE_LIMIT_MAX_REFUNDS = 6
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -258,7 +269,8 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)"
+    r"(?:" + re.escape(KANBAN_WORKER_EXIT_REASON_MARKER) + r"[A-Za-z0-9_]+)?\s*$", re.MULTILINE,
 )
 
 
@@ -276,6 +288,70 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         return None
     matches = _EXIT_TRAILER_RE.findall(raw or "")
     return int(matches[-1]) if matches else None
+
+
+# ``[kanban-worker-exit] rc=<code> reason=<name>`` — the suffix the worker appends only when its own
+# classifier knows WHY it exits (``quiet_single_query.exit_single_query_with_reason``). Separate from
+# ``_EXIT_TRAILER_RE`` on purpose: the fleet's live patch lane splices ``_worker_log_exit_code`` at an
+# exact anchor, and a rail whose anchor matches zero times refuses every patch in the run.
+_EXIT_REASON_LINE_RE = re.compile(
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"\d+"
+    + re.escape(KANBAN_WORKER_EXIT_REASON_MARKER) + r"([A-Za-z0-9_]+)\s*$",
+    re.MULTILINE,
+)
+
+
+def _worker_log_rate_limit_reason(task_id: str, board: Optional[str] = None) -> Optional[str]:
+    """The LAST trailer's ``reason=<name>`` from the worker's own log; None when bare or absent.
+
+    Read positionally, not by "any reason line anywhere": a bare trailer that a later run wrote must
+    not inherit an earlier run's reason, so the last line carrying the trailer prefix decides — and it
+    contributes None when it has no suffix.
+    """
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board) or ""
+    except Exception:
+        return None
+    reason: Optional[str] = None
+    for line in raw.splitlines():
+        if line.startswith(KANBAN_WORKER_EXIT_TRAILER):
+            match = _EXIT_REASON_LINE_RE.match(line)
+            reason = match.group(1) if match else None
+    return reason
+
+
+def _rate_limit_evidence(reason: Optional[str]) -> bool:
+    """True when a 75's trailer reason is the worker's own provider-throttle classification.
+
+    The allowlist is the worker's (``_TRANSIENT_PROVIDER_REASONS``), so one set decides both
+    what a worker exits 75 for and what the sweep accepts as proof. Fails closed: if the set
+    cannot be read, the 75 is charged like any other death, never refunded.
+    """
+    try:
+        from hermes_cli.cli_single_query import _TRANSIENT_PROVIDER_REASONS
+    except Exception:
+        return False
+    return reason in _TRANSIENT_PROVIDER_REASONS
+
+
+def _rate_limit_refunds(conn: sqlite3.Connection, task_id: str) -> int:
+    """Neutral rate-limit requeues since the card last made progress.
+
+    Counts `rate_limited` runs back from the newest run and stops at the first
+    run whose outcome is a real handoff (`completed` / `review_requested`).
+    Any other outcome (a charged crash, an interruption) does NOT reset the
+    count: the card has still not progressed, and letting a crash reset it
+    re-opens the unbounded refund loop this cap exists to close.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'rate_limited' AND id > COALESCE(("
+        "  SELECT MAX(id) FROM task_runs "
+        "  WHERE task_id = ? AND outcome IN ('completed', 'review_requested')"
+        "), 0)",
+        (task_id, task_id),
+    ).fetchone()
+    return int(row[0])
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1108,6 +1184,22 @@ class _DeadWorker:
         # doesn't show a phantom crash for a quota wall.
         return "rate_limited" if self.rate_limited else "crashed"
 
+    def charge_rate_limit_instead(self, cap: int) -> None:
+        """Stop refunding this card's quota wall: book the ordinary crash instead.
+
+        Called when the card already took ``cap`` neutral rate-limit requeues
+        without progress (``_rate_limit_refunds``). The refund exists so a quota
+        window does not spend a card's budget — not so a card can loop on the
+        cooldown forever while the breaker never looks at it.
+        """
+        self.rate_limited = False
+        self.kind = "rate_limited_capped"
+        # Booked as a crash on the event log too, never as a quota requeue.
+        self.event_kind = "crashed"
+        self.error_text += f" — rate-limit refund cap ({cap}) spent; charged as a failure"
+        self.event_payload["exit_kind"] = "rate_limited_capped"
+        self.event_payload["rate_limit_refunds"] = cap
+
 
 def _classify_dead_worker(
     pid: int,
@@ -1170,6 +1262,21 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
             protocol_violation=True,
         )
+    if kind == "rate_limited":
+        # 75 is BSD EX_TEMPFAIL, the repo-wide generic transient code: only the
+        # worker's own throttle classification in its exit trailer makes it a quota
+        # wall. Without it the death is charged, whichever adoption path decoded it.
+        reason = _worker_log_rate_limit_reason(task_id, board=board) if task_id else None
+        if not _rate_limit_evidence(reason):
+            kind = "nonzero_exit"  # EX_TEMPFAIL without throttle evidence
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} exited with code {code} (EX_TEMPFAIL) with no provider-throttle "
+                "evidence in its log — counted as a failure",
+                "crashed",
+                {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code,
+                 "no_throttle_evidence": True},
+            )
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
@@ -1255,6 +1362,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 pid, row["claim_lock"], task_id=row["id"], board=board,
                 started_at=_kb._row_get(row, "worker_started_at"),
             )
+            if dead.rate_limited and _rate_limit_refunds(conn, row["id"]) >= RATE_LIMIT_MAX_REFUNDS:
+                dead.charge_rate_limit_instead(RATE_LIMIT_MAX_REFUNDS)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
