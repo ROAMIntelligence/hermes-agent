@@ -132,6 +132,11 @@ const CRON_LAST_RESULT_TONE: Record<string, CronLastResultTone> = {
   ok: "success",
   delivery_failed: "warning",
   blocked_config: "warning",
+  // A platform stop is held, not a failure: the scheduler keeps the failure
+  // streak and books the run as interrupted (cron/run_termination.py). Same
+  // amber bucket as blocked_config so the badge never reads as a run error.
+  interrupted: "warning",
+  interrupted_after_output: "warning",
   error: "destructive",
 };
 

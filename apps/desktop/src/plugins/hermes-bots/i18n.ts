@@ -434,6 +434,8 @@ type BotsMessages = {
     failed: string
     deliveryFailed: string
     blockedConfig: string
+    interrupted: string
+    interruptedAfterOutput: string
     legacyUnsafe: string
     filterHint: string
     needsRosterFirst: string
@@ -864,6 +866,9 @@ const en: BotsMessages = {
     failed: 'Failed',
     deliveryFailed: 'Ran, but delivery failed',
     blockedConfig: 'Blocked by configuration (not run)',
+    interrupted: 'Stopped by a platform shutdown (not a job failure)',
+    interruptedAfterOutput:
+      'Stopped by a platform shutdown after its output was written (not a job failure)',
     legacyUnsafe: 'Paused for security: delete and recreate this legacy job before running it again.',
     filterHint:
       'Scheduled jobs exist in this profile but none are tagged for this bot. Name a job "[bot:<name>] …" to show it here, or see them in Cron below.',
@@ -1297,6 +1302,9 @@ const ja: BotsMessages = {
     failed: '失敗',
     deliveryFailed: '実行済みですが、配信に失敗しました',
     blockedConfig: '設定によりブロック（未実行）',
+    interrupted: 'プラットフォーム停止により中断（ジョブの失敗ではありません）',
+    interruptedAfterOutput:
+      '出力の書き込み後にプラットフォーム停止で中断（ジョブの失敗ではありません）',
     legacyUnsafe: '安全のため一時停止中です。この旧形式のジョブを削除して作り直してから実行してください。',
     filterHint:
       'このプロファイルには定期実行ジョブがありますが、このボット向けのタグが付いたものはありません。ジョブ名を「[bot:<名前>] …」にするとここに表示されます。下のCronでも確認できます。',
@@ -1714,6 +1722,8 @@ const zh: BotsMessages = {
     failed: '失败',
     deliveryFailed: '已运行，但发送失败',
     blockedConfig: '配置阻止了运行（未执行）',
+    interrupted: '平台停机导致中断（不是作业失败）',
+    interruptedAfterOutput: '输出写入后因平台停机中断（不是作业失败）',
     legacyUnsafe: '为安全起见已暂停：请删除并重新创建此旧任务，然后再运行。',
     filterHint:
       '此配置档案中有定时任务，但没有一个标记给这个机器人。将任务命名为“[bot:<名称>] …”即可显示在这里，也可以在下方的 Cron 中查看。',
@@ -2131,6 +2141,8 @@ const zhHant: BotsMessages = {
     failed: '失敗',
     deliveryFailed: '已執行，但傳送失敗',
     blockedConfig: '設定阻止了執行（未執行）',
+    interrupted: '平台停機導致中斷（不是作業失敗）',
+    interruptedAfterOutput: '輸出寫入後因平台停機中斷（不是作業失敗）',
     legacyUnsafe: '基於安全考量已暫停：請刪除並重新建立此舊工作，然後再執行。',
     filterHint:
       '此設定檔中有排程工作，但沒有任何一個標記給這個機器人。將工作命名為「[bot:<名稱>] …」即可顯示在這裡，也可以在下方的 Cron 中查看。',
