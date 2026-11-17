@@ -358,6 +358,12 @@ export function routineLastResult(status: string | null | undefined, c = botsTex
     case 'blocked_config':
       return c.blockedConfig
 
+    case 'interrupted':
+      return c.interrupted
+
+    case 'interrupted_after_output':
+      return c.interruptedAfterOutput
+
     default:
       return raw
   }

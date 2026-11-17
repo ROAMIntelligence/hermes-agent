@@ -197,6 +197,25 @@ describe("cronLastResult", () => {
     expect(cronLastResult({ last_status: "something_new" })?.tone).toBe("destructive");
   });
 
+  it("is amber for a held platform stop, with the path-only detail", () => {
+    // interrupted / interrupted_after_output are booked by the scheduler when the
+    // platform stops a run: the streak is held and the CLI calls it "not a job
+    // failure", so the badge must not be red.
+    const detail =
+      "Run stopped by the platform (gateway supervisor shutdown) after it had produced its " +
+      "output; failure_streak held (not a job failure). Output was saved at " +
+      "/opt/data/cron/output/fleet-skill-audit-weekly/2026-11-16_10-35-02.md";
+    for (const status of ["interrupted", "interrupted_after_output"]) {
+      expect(cronLastResult({ last_status: status, last_error: detail })).toEqual({
+        status,
+        tone: "warning",
+        detail,
+      });
+      // The literal itself is never the detail, and the badge is not green either.
+      expect(cronLastResult({ last_status: status })?.tone).toBe("warning");
+    }
+  });
+
   it("is amber for blocked_config (preflight refused to burn a run)", () => {
     expect(
       cronLastResult({ last_status: "blocked_config", last_error: "missing API key" }),
