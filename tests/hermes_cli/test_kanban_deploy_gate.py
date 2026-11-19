@@ -210,6 +210,50 @@ def test_squash_mismatch_resolves_through_the_pr_merge_commit(kanban_home, gh):
         "the pre-squash head must never be tested against production"
 
 
+def test_head_only_record_is_unknown_never_refused(kanban_home):
+    """Review P1: a recorded pre-squash head is not testable — never a refusal.
+
+    PR #808's head cb336660 was refused ``merged-not-deployed`` although its squash merge
+    1c076097 WAS the production tip. A head cannot survive a squash merge, so the gate
+    must record why it could not test anything rather than send the worker into a retry
+    that can never succeed.
+    """
+    for key in ("head_sha", "reviewed_head", "pr_head"):
+        api = FakeApi()          # any network call is a failure: nothing is testable
+        with kbc.connect() as conn:
+            tid = _task(conn)
+            assert kb.complete_task(conn, tid, summary="merged as a squash",
+                                    metadata={"repo": REPO, key: HEAD}) is True
+            assert _run_metadata(conn, tid)["deploy-check"] == "UNKNOWN (head-pre-squash)", key
+            assert _status(conn, tid) == "done"
+        assert not api.calls, "%s must not be tested against production" % key
+
+
+def test_head_only_completion_uses_repo_hint_when_unset(kanban_home):
+    """A project-linked card may name its repo only in the workspace/prose."""
+    with kbc.connect() as conn:
+        tid = _task(conn, body="Ships in belac-deploy; the squash merge is not recorded.")
+        verdict = gate.check_deploy_gate(conn, tid, {"head_sha": HEAD}, summary="x",
+                                         api=FakeApi())
+        assert (verdict["verdict"], verdict["reason"]) == ("UNKNOWN", "head-pre-squash")
+        assert verdict["repo"] == REPO
+        assert verdict["sha"] == HEAD
+
+
+def test_head_plus_merge_commit_tests_the_merge_not_the_head(kanban_home):
+    """A record carrying both must test the merge commit — key order is the contract."""
+    api = FakeApi(compare={"ahead_by": 0})
+    with kbc.connect() as conn:
+        tid = _task(conn)
+        verdict = gate.check_deploy_gate(
+            conn, tid, {"repo": REPO, "head_sha": HEAD, "merge_commit": MERGE}, api=api)
+        assert verdict["verdict"] == "DEPLOYED", verdict
+        endpoints = [endpoint for _, endpoint in api.calls]
+        assert any(COMPARE + TIP + "..." + MERGE == endpoint for endpoint in endpoints), endpoints
+        assert not any(COMPARE in endpoint and HEAD in endpoint for endpoint in endpoints), \
+            "the pre-squash head must never be compared to production"
+
+
 def test_pr_url_from_a_prior_run_metadata_resolves(kanban_home, gh):
     """The completing run often carries no PR — the reviewer run before it does."""
     api = gh(FakeApi(pulls={"merged": True, "merge_commit_sha": MERGE, "head": {"sha": HEAD}},
