@@ -741,6 +741,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.MergedNotDeployedError as deploy_err:
+            # deploy-parity completion gate (card t_c7b6e6c8): refused BEFORE any mutation.
+            return tool_error(
+                f"kanban_complete refused: {deploy_err}. Nothing changed; your task is still "
+                f"in-flight. Retry after the publish train lands the merge (hourly :17), or pass "
+                f"metadata {{'deploy': 'not-needed'}} if this card ships no deployable work.")
         except kb.EmptyCompletionError as empty_err:
             # Same shape as the card gate: nothing was mutated, the audit event
             # already landed; the worker retries with evidence instead of stalling.

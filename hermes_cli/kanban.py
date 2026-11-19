@@ -930,6 +930,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except kb.MergedNotDeployedError as deploy_err:
+                # deploy-parity completion gate (card t_c7b6e6c8): the merge exists but
+                # production does not carry it yet -- refuse rather than close un-deployed.
+                fail_msg[tid] = (
+                    f"cannot complete {tid}: {deploy_err}. The merge is not in production yet "
+                    f"(the publish train lands hourly at :17); retry after the publish, or "
+                    f"record 'deploy: not-needed' when the card truly ships nothing.")
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
