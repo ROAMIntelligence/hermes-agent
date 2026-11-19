@@ -240,6 +240,22 @@ def test_head_only_completion_uses_repo_hint_when_unset(kanban_home):
         assert verdict["sha"] == HEAD
 
 
+def test_head_only_never_reaches_the_compare(kanban_home):
+    """Mutation proof for P1: with API answers available, the head is still never tested.
+
+    Before the fix this exact call returned NOT_DEPLOYED: `refs[0]` was the head and the
+    compare endpoint answered ahead_by=3. The fix short-circuits to UNKNOWN
+    (head-pre-squash) without asking, which is why a squashed head can no longer be
+    refused.
+    """
+    api = FakeApi(compare={"ahead_by": 3})
+    with kbc.connect() as conn:
+        tid = _task(conn)
+        verdict = gate.check_deploy_gate(conn, tid, {"repo": REPO, "head_sha": HEAD}, api=api)
+        assert (verdict["verdict"], verdict["reason"]) == ("UNKNOWN", "head-pre-squash"), verdict
+    assert api.calls == [], "a pre-squash head must never be compared: %r" % (api.calls,)
+
+
 def test_head_plus_merge_commit_tests_the_merge_not_the_head(kanban_home):
     """A record carrying both must test the merge commit — key order is the contract."""
     api = FakeApi(compare={"ahead_by": 0})
