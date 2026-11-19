@@ -18,7 +18,9 @@ THE RECORD IS PRE-SQUASH (measurement, not assumption). Card metadata records th
 head: 4 of 4 recent code cards measured `ahead_by > 0` for their recorded head. The
 record does carry the PR, and the PR carries `merge_commit_sha` — so the gate resolves
 PR -> merge commit and tests *that* against production. The recorded head is never used
-for the ancestry test (AC6).
+for the ancestry test (AC6). A record that carries ONLY a head has nothing testable at
+all: it returns `UNKNOWN (head-pre-squash)` — never a refusal, because a squashed head is
+absent from production by construction and the retry advice would be unsatisfiable.
 
 Blast-radius fence: only repos whose production ref has been verified appear in
 ``DEFAULT_PRODUCTION_REFS``. Any other repo (including this repo) is UNKNOWN and cannot
@@ -54,7 +56,12 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 PR_KEYS = ("published_pr", "pr", "pr_url", "pull_request", "prs")
 COMMIT_KEYS = ("merge_commit", "merge_commit_sha", "squash_commit", "published_commit",
-               "commit", "head_sha", "reviewed_head", "pr_head")
+               "commit")
+# Evidence of a pre-squash PR head. NEVER an ancestry-test candidate: a squash merge does
+# not contain the head, so testing it can only produce a false `merged-not-deployed`
+# (review round 1, P1: PR #808's head cb336660 was refused while its merge 1c076097 WAS
+# production). A head-only record resolves to UNKNOWN (head-pre-squash) instead.
+HEAD_KEYS = ("head_sha", "reviewed_head", "pr_head")
 
 _TIP_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 
@@ -95,6 +102,16 @@ def _refs_from_mapping(source: dict, default_repo: str | None) -> list[tuple]:
     return refs
 
 
+def _head_shas_from_mapping(source: dict) -> list[str]:
+    """Pre-squash PR heads recorded in one metadata dict — evidence, never a test ref."""
+    heads: list[str] = []
+    for key in HEAD_KEYS:
+        value = source.get(key)
+        if isinstance(value, str) and SHA_RE.fullmatch(value.strip().lower()):
+            heads.append(value.strip().lower())
+    return heads
+
+
 def _refs_from_contract(contract) -> tuple[list[tuple], str | None]:
     if not isinstance(contract, str):
         return [], None
@@ -128,19 +145,23 @@ def _repo_hints(texts) -> set[str]:
 
 
 def collect_refs(conn, task_id: str, contract, metadata) -> tuple[list[tuple], str | None,
-                                                                 set[str]]:
+                                                                 set[str], list[str]]:
     """Refs in priority order: this completion's metadata, the contract, prior runs, body.
 
-    Returns (refs, repo, repo_hints). ``repo`` is the strongest repo the record names;
-    ``repo_hints`` are repos mentioned by the card's branch/workspace/prose and are only
-    used when ``repo`` is None (an ambiguous hint set is never guessed at).
+    Returns (refs, repo, repo_hints, heads). ``repo`` is the strongest repo the record
+    names; ``repo_hints`` are repos mentioned by the card's branch/workspace/prose and are
+    only used when ``repo`` is None (an ambiguous hint set is never guessed at). ``heads``
+    are recorded pre-squash PR heads: they explain a record that has no testable ref, and
+    are never returned in ``refs``.
     """
     refs: list[tuple] = []
+    heads: list[str] = []
     repo = None
     contract_refs, contract_repo = _refs_from_contract(contract)
     repo = contract_repo
     if isinstance(metadata, dict):
         meta_refs = _refs_from_mapping(metadata, repo)
+        heads.extend(_head_shas_from_mapping(metadata))
         if meta_refs:
             repo = meta_refs[-1][1] or repo
         refs.extend(meta_refs)
@@ -162,6 +183,7 @@ def collect_refs(conn, task_id: str, contract, metadata) -> tuple[list[tuple], s
             continue
         if isinstance(prior, dict):
             refs.extend(_refs_from_mapping(prior, repo))
+            heads.extend(_head_shas_from_mapping(prior))
     hints: set[str] = set()
     try:
         row = conn.execute(
@@ -178,7 +200,7 @@ def collect_refs(conn, task_id: str, contract, metadata) -> tuple[list[tuple], s
     # PR refs win: the recorded head does not survive a squash merge.
     prs = [ref for ref in refs if ref[0] == "pr"]
     commits = [ref for ref in refs if ref[0] == "commit"]
-    return prs + commits, repo, hints
+    return prs + commits, repo, hints, heads
 
 
 def _not_needed(metadata, text: str) -> bool:
@@ -278,18 +300,29 @@ def check_deploy_gate(conn, task_id: str, metadata=None, *, summary=None, result
     if row is None:
         return None
     contract = row["completion_contract"] if hasattr(row, "keys") else row[0]
-    refs, repo, hints = collect_refs(conn, task_id, contract, metadata)
+    refs, repo, hints, heads = collect_refs(conn, task_id, contract, metadata)
     declared = isinstance(contract, str) and contract not in ("", "local-only")
     intends_deploy = declared or bool(refs)
     if not intends_deploy and isinstance(metadata, dict):
         # The card may claim a deploy artifact that does not resolve to a sha at all
         # (e.g. published_pr still "pending"). That is worth recording as UNKNOWN.
         intends_deploy = any(isinstance(metadata.get(key), str) and metadata.get(key, "").strip()
-                             for key in PR_KEYS + COMMIT_KEYS)
+                             for key in PR_KEYS + COMMIT_KEYS + HEAD_KEYS)
     if not intends_deploy:
         return None
 
     if not refs:
+        if repo is None and len(hints) == 1:
+            repo = next(iter(hints))
+        if heads:
+            # A head-only record has nothing testable: a squash merge never contains the
+            # head, so an ancestry test could only refuse a deployed card (review P1).
+            log.info("deploy-gate: record carries only a pre-squash head %s; "
+                     "nothing testable against production", heads[0][:12])
+            return _verdict("UNKNOWN", "head-pre-squash", repo=repo, sha=heads[0],
+                            detail="the record names only PR head %s, which a squash merge "
+                                   "never contains; record the PR (it carries merge_commit_sha) "
+                                   "or the merge commit" % heads[0][:12])
         return _verdict("UNKNOWN", "no-commit-recorded", repo=repo,
                         detail="the card records no PR and no full commit sha")
     kind, ref_repo, value = refs[0]
