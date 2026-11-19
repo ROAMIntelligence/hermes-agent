@@ -2699,6 +2699,20 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class MergedNotDeployedError(ValueError):
+    """``complete_task`` refused: the card's resolved merge commit is absent from its
+    repo's production ref. 2026-11-18 closed two cards as done while their bytes were
+    not running, so the completion path now refuses on positive evidence instead of
+    trusting the word "done". A ``ValueError`` so tool error handlers treat it as
+    recoverable (retry after the publish train lands, or record ``deploy: not-needed``).
+    The message is the gate's own detail line, ``merged-not-deployed: <sha>``."""
+
+    def __init__(self, task_id: str, detail: str):
+        self.task_id = task_id
+        self.detail = detail
+        super().__init__(detail)
+
+
 class LiveClaimError(ValueError):
     """``complete_task`` refused: the task is ``running`` under a live claim and
     the caller neither owns its run (``expected_run_id``) nor passed ``force``.
@@ -2765,6 +2779,17 @@ def complete_task(
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
+    # deploy-parity completion gate (card t_c7b6e6c8): a code card may not close
+    # while its work is absent from the repo's production ref. Fail-open by
+    # design -- an unrunnable check stamps deploy-check: UNKNOWN (<reason>) and
+    # completes. Never inside the txn: this can touch the network.
+    from hermes_cli.kanban_deploy_gate import check_deploy_gate, stamp_deploy_check
+    _deploy = check_deploy_gate(conn, task_id, metadata, summary=summary, result=result,
+                                force=force)
+    if _deploy is not None:
+        metadata = stamp_deploy_check(metadata, _deploy)
+        if _deploy["verdict"] == "NOT_DEPLOYED" and not force:
+            raise MergedNotDeployedError(task_id, _deploy["detail"])
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
