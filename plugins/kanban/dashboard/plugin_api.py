@@ -198,17 +198,32 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-_DIAG_EVENT_LOOKBACK_HOURS = 24 * 7  # every diagnostics rule window is <= 24 h
+_DIAG_EVENT_LOOKBACK_HOURS = 24 * 7
+
+# Rules that read the NEWEST event of a kind with no age window: the newest row
+# per (task, kind) of ``_ANCHOR_EVENT_KINDS`` decides a diagnostic and a newer
+# row of a ``_CLEARING_EVENT_KINDS`` kind clears it (hermes_cli.kanban_diagnostics
+# ``_rule_stuck_in_blocked``, ``_rule_review_dependency_deadlock``,
+# ``_rule_repeated_failures`` / ``_latest_gave_up_is_terminal_provider``,
+# ``_rule_hallucinated_cards`` and ``_rule_prose_phantom_refs``). Time-windowing
+# those rows made a 30-day block render no diagnostic at all: "blocked 720h ago"
+# and "never blocked" became indistinguishable. They are preserved at any age.
+_ANCHOR_EVENT_KINDS = ("blocked", "gave_up")
+# Rare by construction, and the rules count every hit since the last clearing
+# event, so all rows are preserved rather than only the newest one.
+_RARE_EVENT_KINDS = ("completion_blocked_hallucination", "suspected_hallucinated_references")
+_CLEARING_EVENT_KINDS = ("commented", "unblocked", "completed", "edited", "promoted", "claimed")
 
 
 def _diag_event_lookback_hours(config: Optional[dict]) -> float:
-    """Hours of ``task_events`` history the diagnostics rules are allowed to read.
+    """Hours of *bulk* ``task_events`` history the diagnostics rules read.
 
-    Rules only look back at most 24 h (``blocked_stale_hours`` /
-    ``block_cycle_window_seconds``), so 7 d is a 7x margin. Before this bound
-    ``/board`` slurped EVERY event ever written for every non-archived task
-    (415k rows / 24 MB payload on the production board), so one poll allocated
-    hundreds of MB and drove the dashboard's RSS churn.
+    The window bounds the high-volume kinds (heartbeats, respawns, spawns). The
+    handful of rows that anchor a rule are re-read at any age by
+    :func:`_merge_rule_events`, so the window can never hide a diagnostic.
+    Before any bound ``/board`` slurped EVERY event ever written for every
+    non-archived task (415k rows / 26 MB payload on the production board), so
+    one poll allocated hundreds of MB and drove the dashboard's RSS churn.
     """
     try:
         hours = float((config or {}).get("event_lookback_hours", _DIAG_EVENT_LOOKBACK_HOURS))
@@ -217,11 +232,65 @@ def _diag_event_lookback_hours(config: Optional[dict]) -> float:
     return max(1.0, hours)
 
 
+def _merge_rule_events(conn: sqlite3.Connection, events_by_task: dict[str, list], row_ids: list[str]) -> None:
+    """Merge the newest rule-driving event of each kind into the bounded history.
+
+    ``events_by_task`` holds the lookback-bounded bulk of ``task_events``. The
+    diagnostics rules compare the newest ``blocked`` / ``gave_up`` / hallucination
+    row against the newest clearing row with no age window, so truncating those
+    made an old block render no diagnostic at all (live board: 720 h, 570 h and
+    362 h blocks had silently lost theirs). One row per (task, kind) is fetched
+    unbounded — the ``idx_events_kind`` index keeps this off the table scan —
+    and merged in arrival (id) order, which is what ``_active_hallucination_events``
+    and ``_latest_gave_up_is_terminal_provider`` require. Mutates ``events_by_task``.
+    """
+    if not row_ids:
+        return
+    seen_ids = {row["id"] for rows in events_by_task.values() for row in rows}
+
+    def _merge(rows) -> set[str]:
+        touched: set[str] = set()
+        for row in rows:
+            if row["id"] in seen_ids:
+                continue
+            seen_ids.add(row["id"])
+            events_by_task.setdefault(row["task_id"], []).append(row)
+            touched.add(row["task_id"])
+        return touched
+
+    placeholders = _placeholders(row_ids)
+    affected = _merge(conn.execute(
+        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) "
+        f"AND kind IN ({_placeholders(_RARE_EVENT_KINDS)}) ORDER BY id",
+        tuple(row_ids) + _RARE_EVENT_KINDS,
+    ).fetchall())
+    affected |= _merge(conn.execute(
+        f"SELECT e.* FROM task_events e JOIN ("
+        f" SELECT task_id, kind, MAX(id) AS mid FROM task_events"
+        f" WHERE task_id IN ({placeholders}) AND kind IN ({_placeholders(_ANCHOR_EVENT_KINDS)})"
+        f" GROUP BY task_id, kind) m ON e.id = m.mid ORDER BY e.id",
+        tuple(row_ids) + _ANCHOR_EVENT_KINDS,
+    ).fetchall())
+    if affected:
+        affected_ids = sorted(affected)
+        _merge(conn.execute(
+            f"SELECT e.* FROM task_events e JOIN ("
+            f" SELECT task_id, kind, MAX(id) AS mid FROM task_events"
+            f" WHERE task_id IN ({_placeholders(affected_ids)})"
+            f" AND kind IN ({_placeholders(_CLEARING_EVENT_KINDS)})"
+            f" GROUP BY task_id, kind) m ON e.id = m.mid ORDER BY e.id",
+            tuple(affected_ids) + _CLEARING_EVENT_KINDS,
+        ).fetchall())
+    for rows in events_by_task.values():
+        rows.sort(key=lambda row: row["id"])
+
+
 def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
-    queries (tasks, events, runs) — slurps the board, but events are bounded to the
-    diagnostics lookback window (``kanban.diagnostics.event_lookback_hours``, default 7 d)
-    so a long-lived board cannot make every ``/board`` poll read its whole event history."""
+    queries (tasks, events, runs) — slurps the board, but the bulk of ``task_events`` is
+    bounded to the diagnostics lookback window (``kanban.diagnostics.event_lookback_hours``,
+    default 7 d) while the rows that anchor a rule are preserved at any age by
+    :func:`_merge_rule_events`."""
     from hermes_cli.config import load_config
 
     if task_ids is not None and not task_ids:
@@ -248,6 +317,7 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
 
     events_by_task = _rows_by_task(
         "task_events", since=int(time.time()) - int(_diag_event_lookback_hours(diag_config) * 3600))
+    _merge_rule_events(conn, events_by_task, row_ids)
     runs_by_task = _rows_by_task("task_runs")
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}

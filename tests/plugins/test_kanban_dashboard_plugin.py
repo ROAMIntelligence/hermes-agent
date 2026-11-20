@@ -1138,10 +1138,10 @@ class _SpyConn:
         return getattr(self._real, name)
 
 
-def _insert_event(conn, task_id, created_at, kind="note"):
+def _insert_event(conn, task_id, created_at, kind="note", payload="{}"):
     cur = conn.execute(
         "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-        (task_id, kind, "{}", int(created_at)),
+        (task_id, kind, payload, int(created_at)),
     )
     conn.commit()
     return cur.lastrowid
@@ -1213,3 +1213,116 @@ def test_recent_events_still_reach_diagnostics(kanban_home):
     assert recent_id in read_ids, read_ids
     assert ancient_id not in read_ids, read_ids
     assert all(r["task_id"] == task_id for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics event lookback: the rows that anchor a RULE survive the bound
+# ---------------------------------------------------------------------------
+#
+# The rules read the newest blocked / gave_up / hallucination event and the
+# newest clearing event with NO age window. Bounding those rows to the bulk
+# lookback made an old block indistinguishable from "never blocked" (live board:
+# 30.0 d, 23.8 d and 15.1 d blocks rendered no diagnostic at all).
+
+def _diag_kinds(mod, conn, task_id):
+    out = mod._compute_task_diagnostics(conn, [task_id])
+    return {d["kind"] for d in out.get(task_id, [])}
+
+
+def test_blocked_older_than_lookback_still_yields_stuck_in_blocked(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="old block", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "needs input"}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "stuck_in_blocked" in kinds, kinds
+
+
+def test_old_block_cleared_by_old_comment_stays_clear(kanban_home):
+    """The merge must not resurrect a block that a later (also old) comment cleared."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="old block cleared", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "needs input"}))
+        _insert_event(conn, task_id, time.time() - 20 * 86400, kind="commented")
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "stuck_in_blocked" not in kinds, kinds
+
+
+def test_review_block_older_than_lookback_still_yields_deadlock(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        parent = kb.create_task(conn, title="impl phase", assignee="tester")
+        child = kb.create_task(conn, title="waiting child", assignee="tester",
+                               parents=[parent])
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (parent,))
+        conn.commit()
+        _insert_event(conn, parent, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "review-required: 3 files changed"}))
+        kinds = _diag_kinds(mod, conn, parent)
+
+    assert "review_dependency_deadlock" in kinds, kinds
+
+
+def test_hallucinated_cards_older_than_lookback_still_reported(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="phantom cards", assignee="tester")
+        _insert_event(conn, task_id, time.time() - 30 * 86400,
+                      kind="completion_blocked_hallucination",
+                      payload=json.dumps({"phantom_cards": ["t_0000dead"]}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "hallucinated_cards" in kinds, kinds
+
+
+def test_prose_phantom_refs_older_than_lookback_still_reported(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="phantom refs", assignee="tester")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400,
+                      kind="suspected_hallucinated_references",
+                      payload=json.dumps({"phantom_refs": ["t_0000beef"]}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "prose_phantom_refs" in kinds, kinds
+
+
+def test_terminal_gave_up_older_than_lookback_still_reported(kanban_home):
+    """A terminal-provider trip blocks below the failure threshold; the trip event
+    itself is the only evidence, so it must survive the bound."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="terminal trip", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked', consecutive_failures=1 "
+                     "WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="gave_up",
+                      payload=json.dumps({"terminal_provider": True}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "repeated_failures" in kinds, kinds
+
+
+def test_task_events_kind_index_exists(kanban_home):
+    """The unbounded newest-of-kind lookup needs the (kind, id) index to stay off
+    a full task_events scan (~160 ms -> ~5 ms on a 441k-row board)."""
+    conn = kb.connect()
+    try:
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_events'")}
+    finally:
+        conn.close()
+
+    assert "idx_events_kind" in names, names
