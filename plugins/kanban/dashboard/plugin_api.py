@@ -198,9 +198,30 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
+_DIAG_EVENT_LOOKBACK_HOURS = 24 * 7  # every diagnostics rule window is <= 24 h
+
+
+def _diag_event_lookback_hours(config: Optional[dict]) -> float:
+    """Hours of ``task_events`` history the diagnostics rules are allowed to read.
+
+    Rules only look back at most 24 h (``blocked_stale_hours`` /
+    ``block_cycle_window_seconds``), so 7 d is a 7x margin. Before this bound
+    ``/board`` slurped EVERY event ever written for every non-archived task
+    (415k rows / 24 MB payload on the production board), so one poll allocated
+    hundreds of MB and drove the dashboard's RSS churn.
+    """
+    try:
+        hours = float((config or {}).get("event_lookback_hours", _DIAG_EVENT_LOOKBACK_HOURS))
+    except (TypeError, ValueError):
+        hours = _DIAG_EVENT_LOOKBACK_HOURS
+    return max(1.0, hours)
+
+
 def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
-    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+    queries (tasks, events, runs) — slurps the board, but events are bounded to the
+    diagnostics lookback window (``kanban.diagnostics.event_lookback_hours``, default 7 d)
+    so a long-lived board cannot make every ``/board`` poll read its whole event history."""
     from hermes_cli.config import load_config
 
     if task_ids is not None and not task_ids:
@@ -214,14 +235,19 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
         return {}
     row_ids = [r["id"] for r in rows]
 
-    def _rows_by_task(table: str) -> dict[str, list]:
+    def _rows_by_task(table: str, *, since: int = 0) -> dict[str, list]:
         by_task: dict[str, list] = {tid: [] for tid in row_ids}
-        for row in conn.execute(
-            f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
+        sql = f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)})"
+        args: tuple = tuple(row_ids)
+        if since:
+            sql += " AND created_at >= ?"
+            args = args + (since,)
+        for row in conn.execute(sql + " ORDER BY id", args):
             by_task.setdefault(row["task_id"], []).append(row)
         return by_task
 
-    events_by_task = _rows_by_task("task_events")
+    events_by_task = _rows_by_task(
+        "task_events", since=int(time.time()) - int(_diag_event_lookback_hours(diag_config) * 3600))
     runs_by_task = _rows_by_task("task_runs")
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}

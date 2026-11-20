@@ -27,8 +27,8 @@ from hermes_cli import kanban_db_connect as kbc
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return the module."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +40,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -1113,3 +1118,98 @@ def test_board_card_exposes_current_run_start(client):
     # The detail endpoint carries the same contract.
     detail = client.get(f"/api/plugins/kanban/tasks/{t}").json()["task"]
     assert detail["current_run_started_at"] == retry_start
+
+# ---------------------------------------------------------------------------
+# Diagnostics event lookback: /board must not slurp the whole event history
+# ---------------------------------------------------------------------------
+
+class _SpyConn:
+    """Records every (sql, params) pair, delegating everything else to the real connection."""
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append((" ".join(sql.split()), tuple(params)))
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _insert_event(conn, task_id, created_at, kind="note"):
+    cur = conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, kind, "{}", int(created_at)),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _events_statement(spy):
+    for sql, params in spy.calls:
+        if sql.startswith("SELECT * FROM task_events"):
+            return sql, params
+    raise AssertionError(
+        "the diagnostics pass issued no task_events statement; got: "
+        + repr([sql[:60] for sql, _ in spy.calls])
+    )
+
+
+def test_diag_event_fetch_is_bounded(kanban_home):
+    """task_events is read through a created_at bound; task_runs stays unbounded."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag probe", assignee="tester")
+        _insert_event(conn, task_id, time.time())
+        spy = _SpyConn(conn)
+        started = time.time()
+        mod._compute_task_diagnostics(spy, [task_id])
+        finished = time.time()
+
+    sql, params = _events_statement(spy)
+    assert "created_at >= ? ORDER BY id" in sql, sql
+    expected_cutoff = (started + finished) / 2 - 7 * 86400
+    assert abs(params[-1] - expected_cutoff) <= 120, (params[-1], expected_cutoff)
+
+    runs = [s for s, _ in spy.calls if s.startswith("SELECT * FROM task_runs")]
+    assert runs, "task_runs was not read at all"
+    assert all("created_at" not in s for s in runs), runs
+
+
+def test_diag_event_lookback_is_configurable(kanban_home):
+    """kanban.diagnostics.event_lookback_hours moves the bound."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  diagnostics:\n    event_lookback_hours: 2\n", encoding="utf-8"
+    )
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag config", assignee="tester")
+        spy = _SpyConn(conn)
+        started = time.time()
+        mod._compute_task_diagnostics(spy, [task_id])
+        finished = time.time()
+
+    _sql, params = _events_statement(spy)
+    expected_cutoff = (started + finished) / 2 - 2 * 3600
+    assert abs(params[-1] - expected_cutoff) <= 120, (params[-1], expected_cutoff)
+
+
+def test_recent_events_still_reach_diagnostics(kanban_home):
+    """Recent events survive the bound; events older than it are not read at all."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag recent", assignee="tester")
+        now = time.time()
+        recent_id = _insert_event(conn, task_id, now)
+        ancient_id = _insert_event(conn, task_id, now - 30 * 86400)
+        spy = _SpyConn(conn)
+        mod._compute_task_diagnostics(spy, [task_id])
+        sql, params = _events_statement(spy)
+        rows = list(conn.execute(sql, params))
+
+    read_ids = {r["id"] for r in rows}
+    assert recent_id in read_ids, read_ids
+    assert ancient_id not in read_ids, read_ids
+    assert all(r["task_id"] == task_id for r in rows)
