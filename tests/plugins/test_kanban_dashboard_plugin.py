@@ -1318,11 +1318,9 @@ def test_terminal_gave_up_older_than_lookback_still_reported(kanban_home):
 def test_task_events_kind_index_exists(kanban_home):
     """The unbounded newest-of-kind lookup needs the (kind, id) index to stay off
     a full task_events scan (~160 ms -> ~5 ms on a 441k-row board)."""
-    conn = kb.connect()
-    try:
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
         names = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_events'")}
-    finally:
-        conn.close()
 
     assert "idx_events_kind" in names, names
