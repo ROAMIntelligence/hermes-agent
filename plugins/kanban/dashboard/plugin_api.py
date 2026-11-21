@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
-from fastapi.responses import FileResponse
+    APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
+    WebSocket, WebSocketDisconnect, status as http_status)
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from starlette.requests import HTTPConnection
 
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
@@ -39,7 +41,18 @@ from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_pa
 
 log = logging.getLogger(__name__)
 
-router = APIRouter()
+
+async def _invalidate_on_mutation(conn: HTTPConnection) -> None:
+    """Router-level dependency: a mutating dashboard call drops the board cache.
+
+    ``HTTPConnection`` (not ``Request``) so the same dependency can sit on the
+    router that also carries the ``/ws/events`` websocket route.
+    """
+    if conn.scope.get("method", "GET") not in ("GET", "HEAD", "OPTIONS"):
+        _invalidate_board_cache()
+
+
+router = APIRouter(dependencies=[Depends(_invalidate_on_mutation)])
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
@@ -97,6 +110,47 @@ def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.C
     board = _resolve_board(board)
     with closing(_conn(board=board)) as conn:
         yield board, conn
+
+
+# --- Encoded board cache ----------------------------------------------------
+#
+# ``GET /board`` rebuilt and re-encoded the whole payload on every client poll —
+# 36.5 MB of JSON per call at 1.27 calls/s on the live board, 92 % of sampled
+# dashboard CPU in ``jsonable_encoder``/``iterencode``, and the dominant source of
+# this process's allocation churn (t_de536fc1). ``coalesced_read`` only collapses
+# *in-flight* duplicates, so spaced polls each paid the full cost.
+#
+# The SPA polls every 2 s per client; a TTL equal to that poll interval lets a
+# burst of clients share one build + one encode, and the cache holds encoded
+# bytes so a hit is a memcpy, not a re-encode. Freshness bound: one poll.
+#
+# Invalidation is deliberately *not* on every write: the gateway and dispatcher
+# write to this DB continuously (a 1 Hz writer is enough to defeat the cache),
+# and a board poll is already the SPA's staleness unit. Mutations that arrive
+# through this dashboard API invalidate up front (``_invalidate_on_mutation``)
+# so a card the user just moved does not snap back on the next poll; writes from
+# other processes appear on the next TTL boundary, i.e. within one poll.
+_BOARD_CACHE_TTL_S = 2.0
+_BOARD_CACHE_MAX = 16
+_board_cache: dict[tuple, tuple[float, bytes]] = {}
+
+
+def _invalidate_board_cache() -> None:
+    _board_cache.clear()
+
+
+def _board_cache_key(tenant, include_archived, board, workflow_template_id, current_step_key) -> tuple:
+    from hermes_constants import get_hermes_home
+    return (str(get_hermes_home()), tenant, bool(include_archived), board,
+            workflow_template_id, current_step_key)
+
+
+def _encode_board(payload: dict) -> bytes:
+    """Encode exactly like Starlette's ``JSONResponse`` (compact separators, UTF-8)."""
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
 
 
 def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:
@@ -187,6 +241,22 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     return d
 
 
+def _board_card_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
+                     current_run_started_at: Optional[int] = None) -> dict[str, Any]:
+    """List shape for ``GET /board``: no task body.
+
+    Bodies are ~81 % of the board payload (~25 MB of ~31 MB on the live board) and the
+    card grid never renders them — the drawer fetches the full task from
+    ``GET /tasks/{id}``, which keeps its body. Omitting them cuts the per-poll rebuild
+    and re-encode roughly in half a dozen times, which is where this dashboard's
+    allocation churn came from (t_de536fc1).
+    """
+    d = _task_dict(task, latest_summary=latest_summary,
+                   current_run_started_at=current_run_started_at)
+    d["body"] = None
+    return d
+
+
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     """``stored_path`` is the absolute on-disk path workers read; UI downloads by ``id``."""
     return {
@@ -198,9 +268,99 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
+_DIAG_EVENT_LOOKBACK_HOURS = 24 * 7
+
+# Rules that read the NEWEST event of a kind with no age window: the newest row
+# per (task, kind) of ``_ANCHOR_EVENT_KINDS`` decides a diagnostic and a newer
+# row of a ``_CLEARING_EVENT_KINDS`` kind clears it (hermes_cli.kanban_diagnostics
+# ``_rule_stuck_in_blocked``, ``_rule_review_dependency_deadlock``,
+# ``_rule_repeated_failures`` / ``_latest_gave_up_is_terminal_provider``,
+# ``_rule_hallucinated_cards`` and ``_rule_prose_phantom_refs``). Time-windowing
+# those rows made a 30-day block render no diagnostic at all: "blocked 720h ago"
+# and "never blocked" became indistinguishable. They are preserved at any age.
+_ANCHOR_EVENT_KINDS = ("blocked", "gave_up")
+# Rare by construction, and the rules count every hit since the last clearing
+# event, so all rows are preserved rather than only the newest one.
+_RARE_EVENT_KINDS = ("completion_blocked_hallucination", "suspected_hallucinated_references")
+_CLEARING_EVENT_KINDS = ("commented", "unblocked", "completed", "edited", "promoted", "claimed")
+
+
+def _diag_event_lookback_hours(config: Optional[dict]) -> float:
+    """Hours of *bulk* ``task_events`` history the diagnostics rules read.
+
+    The window bounds the high-volume kinds (heartbeats, respawns, spawns). The
+    handful of rows that anchor a rule are re-read at any age by
+    :func:`_merge_rule_events`, so the window can never hide a diagnostic.
+    Before any bound ``/board`` slurped EVERY event ever written for every
+    non-archived task (415k rows / 26 MB payload on the production board), so
+    one poll allocated hundreds of MB and drove the dashboard's RSS churn.
+    """
+    try:
+        hours = float((config or {}).get("event_lookback_hours", _DIAG_EVENT_LOOKBACK_HOURS))
+    except (TypeError, ValueError):
+        hours = _DIAG_EVENT_LOOKBACK_HOURS
+    return max(1.0, hours)
+
+
+def _merge_rule_events(conn: sqlite3.Connection, events_by_task: dict[str, list], row_ids: list[str]) -> None:
+    """Merge the newest rule-driving event of each kind into the bounded history.
+
+    ``events_by_task`` holds the lookback-bounded bulk of ``task_events``. The
+    diagnostics rules compare the newest ``blocked`` / ``gave_up`` / hallucination
+    row against the newest clearing row with no age window, so truncating those
+    made an old block render no diagnostic at all (live board: 720 h, 570 h and
+    362 h blocks had silently lost theirs). One row per (task, kind) is fetched
+    unbounded — the ``idx_events_kind`` index keeps this off the table scan —
+    and merged in arrival (id) order, which is what ``_active_hallucination_events``
+    and ``_latest_gave_up_is_terminal_provider`` require. Mutates ``events_by_task``.
+    """
+    if not row_ids:
+        return
+    seen_ids = {row["id"] for rows in events_by_task.values() for row in rows}
+
+    def _merge(rows) -> set[str]:
+        touched: set[str] = set()
+        for row in rows:
+            if row["id"] in seen_ids:
+                continue
+            seen_ids.add(row["id"])
+            events_by_task.setdefault(row["task_id"], []).append(row)
+            touched.add(row["task_id"])
+        return touched
+
+    placeholders = _placeholders(row_ids)
+    affected = _merge(conn.execute(
+        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) "
+        f"AND kind IN ({_placeholders(_RARE_EVENT_KINDS)}) ORDER BY id",
+        tuple(row_ids) + _RARE_EVENT_KINDS,
+    ).fetchall())
+    affected |= _merge(conn.execute(
+        f"SELECT e.* FROM task_events e JOIN ("
+        f" SELECT task_id, kind, MAX(id) AS mid FROM task_events"
+        f" WHERE task_id IN ({placeholders}) AND kind IN ({_placeholders(_ANCHOR_EVENT_KINDS)})"
+        f" GROUP BY task_id, kind) m ON e.id = m.mid ORDER BY e.id",
+        tuple(row_ids) + _ANCHOR_EVENT_KINDS,
+    ).fetchall())
+    if affected:
+        affected_ids = sorted(affected)
+        _merge(conn.execute(
+            f"SELECT e.* FROM task_events e JOIN ("
+            f" SELECT task_id, kind, MAX(id) AS mid FROM task_events"
+            f" WHERE task_id IN ({_placeholders(affected_ids)})"
+            f" AND kind IN ({_placeholders(_CLEARING_EVENT_KINDS)})"
+            f" GROUP BY task_id, kind) m ON e.id = m.mid ORDER BY e.id",
+            tuple(affected_ids) + _CLEARING_EVENT_KINDS,
+        ).fetchall())
+    for rows in events_by_task.values():
+        rows.sort(key=lambda row: row["id"])
+
+
 def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
-    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+    queries (tasks, events, runs) — slurps the board, but the bulk of ``task_events`` is
+    bounded to the diagnostics lookback window (``kanban.diagnostics.event_lookback_hours``,
+    default 7 d) while the rows that anchor a rule are preserved at any age by
+    :func:`_merge_rule_events`."""
     from hermes_cli.config import load_config
 
     if task_ids is not None and not task_ids:
@@ -214,14 +374,20 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
         return {}
     row_ids = [r["id"] for r in rows]
 
-    def _rows_by_task(table: str) -> dict[str, list]:
+    def _rows_by_task(table: str, *, since: int = 0) -> dict[str, list]:
         by_task: dict[str, list] = {tid: [] for tid in row_ids}
-        for row in conn.execute(
-            f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
+        sql = f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)})"
+        args: tuple = tuple(row_ids)
+        if since:
+            sql += " AND created_at >= ?"
+            args = args + (since,)
+        for row in conn.execute(sql + " ORDER BY id", args):
             by_task.setdefault(row["task_id"], []).append(row)
         return by_task
 
-    events_by_task = _rows_by_task("task_events")
+    events_by_task = _rows_by_task(
+        "task_events", since=int(time.time()) - int(_diag_event_lookback_hours(diag_config) * 3600))
+    _merge_rule_events(conn, events_by_task, row_ids)
     runs_by_task = _rows_by_task("task_runs")
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}
@@ -318,8 +484,8 @@ def get_board(
         run_start_map = kanban_db.current_run_started_ats(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
-                           current_run_started_at=run_start_map.get(t.id))
+            d = _board_card_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                                 current_run_started_at=run_start_map.get(t.id))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -353,13 +519,24 @@ async def get_board_endpoint(
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
 ):
     # Resolve selection before keying so a board switch cannot join an older read.
-    return await _read_board(
+    board_slug = board or kanban_db.get_current_board()
+    key = _board_cache_key(tenant, include_archived, board_slug,
+                           workflow_template_id, current_step_key)
+    cached = _board_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _BOARD_CACHE_TTL_S:
+        return Response(content=cached[1], media_type="application/json")
+    payload = await _read_board(
         tenant=tenant,
         include_archived=include_archived,
-        board=board or kanban_db.get_current_board(),
+        board=board_slug,
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
     )
+    encoded = _encode_board(payload)
+    _board_cache[key] = (time.monotonic(), encoded)
+    while len(_board_cache) > _BOARD_CACHE_MAX:
+        _board_cache.pop(next(iter(_board_cache)))
+    return Response(content=encoded, media_type="application/json")
 
 
 # --- GET /tasks/:id ---------------------------------------------------------

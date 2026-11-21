@@ -27,8 +27,8 @@ from hermes_cli import kanban_db_connect as kbc
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return the module."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +40,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -57,6 +62,16 @@ def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
+
+
+@pytest.fixture
+def plugin_client(kanban_home):
+    """Like ``client`` but also returns the loaded plugin module, so tests can
+    inspect the encoded-board cache the module holds."""
+    mod = _load_plugin_module()
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    return mod, TestClient(app)
 
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
@@ -108,6 +123,78 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+def test_board_lists_without_bodies_while_detail_keeps_them(plugin_client):
+    """The list shape drops task bodies (they were 81 % of the payload); the
+    drawer's ``GET /tasks/{id}`` keeps the full text."""
+    _mod, client = plugin_client
+    body = "**Goal**\n" + ("detail " * 800)
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Fat card", "body": body, "assignee": "researcher"},
+    ).json()["task"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = next(t for c in board["columns"] for t in c["tasks"] if t["id"] == created["id"])
+    assert card["body"] is None
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()["task"]
+    assert detail["body"] == body
+
+
+def test_board_encoded_payload_is_shared_within_ttl_and_rebuilt_after(plugin_client, monkeypatch):
+    """A burst of clients inside one poll interval must pay for one rebuild."""
+    mod, client = plugin_client
+    calls = {"n": 0}
+    real_list_tasks = kb.list_tasks
+
+    def counting_list_tasks(*args, **kwargs):
+        calls["n"] += 1
+        return real_list_tasks(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "list_tasks", counting_list_tasks)
+
+    first = client.get("/api/plugins/kanban/board")
+    assert first.status_code == 200
+    assert calls["n"] == 1
+    second = client.get("/api/plugins/kanban/board")
+    assert second.status_code == 200
+    assert second.json()["latest_event_id"] == first.json()["latest_event_id"]
+    assert calls["n"] == 1, "second poll inside the TTL rebuilt the board"
+
+    # Distinguish the board/tenant axes: a different key must rebuild immediately.
+    client.get("/api/plugins/kanban/board?tenant=nobody")
+    assert calls["n"] == 2
+
+    # Expiry: with the TTL at zero the next poll rebuilds.
+    monkeypatch.setattr(mod, "_BOARD_CACHE_TTL_S", 0.0)
+    client.get("/api/plugins/kanban/board")
+    assert calls["n"] == 3
+
+
+def test_board_cache_survives_an_external_write_but_drops_on_api_mutation(plugin_client):
+    """The cache is invalidated by dashboard mutations, not by other processes:
+    the gateway/dispatcher write continuously and the SPA's poll is the staleness
+    unit, so an out-of-process write costs at most one TTL of latency."""
+    mod, client = plugin_client
+    client.get("/api/plugins/kanban/board")
+    assert mod._board_cache
+
+    # A write from another connection (gateway/dispatcher/CLI) must not drop it.
+    conn = kbc.connect()
+    try:
+        kb.create_task(conn, title="written by another process")
+    finally:
+        conn.close()
+
+    assert mod._board_cache, "an external write defeated the encoded-board cache"
+
+    # A mutation through this API must drop it, so the user's own move never snaps back.
+    client.post("/api/plugins/kanban/tasks", json={"title": "cache buster"})
+    assert mod._board_cache == {}
+    board = client.get("/api/plugins/kanban/board").json()
+    assert any(t["title"] == "cache buster" for c in board["columns"] for t in c["tasks"])
+
 
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
@@ -1113,3 +1200,209 @@ def test_board_card_exposes_current_run_start(client):
     # The detail endpoint carries the same contract.
     detail = client.get(f"/api/plugins/kanban/tasks/{t}").json()["task"]
     assert detail["current_run_started_at"] == retry_start
+
+# ---------------------------------------------------------------------------
+# Diagnostics event lookback: /board must not slurp the whole event history
+# ---------------------------------------------------------------------------
+
+class _SpyConn:
+    """Records every (sql, params) pair, delegating everything else to the real connection."""
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append((" ".join(sql.split()), tuple(params)))
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _insert_event(conn, task_id, created_at, kind="note", payload="{}"):
+    cur = conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, kind, payload, int(created_at)),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _events_statement(spy):
+    for sql, params in spy.calls:
+        if sql.startswith("SELECT * FROM task_events"):
+            return sql, params
+    raise AssertionError(
+        "the diagnostics pass issued no task_events statement; got: "
+        + repr([sql[:60] for sql, _ in spy.calls])
+    )
+
+
+def test_diag_event_fetch_is_bounded(kanban_home):
+    """task_events is read through a created_at bound; task_runs stays unbounded."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag probe", assignee="tester")
+        _insert_event(conn, task_id, time.time())
+        spy = _SpyConn(conn)
+        started = time.time()
+        mod._compute_task_diagnostics(spy, [task_id])
+        finished = time.time()
+
+    sql, params = _events_statement(spy)
+    assert "created_at >= ? ORDER BY id" in sql, sql
+    expected_cutoff = (started + finished) / 2 - 7 * 86400
+    assert abs(params[-1] - expected_cutoff) <= 120, (params[-1], expected_cutoff)
+
+    runs = [s for s, _ in spy.calls if s.startswith("SELECT * FROM task_runs")]
+    assert runs, "task_runs was not read at all"
+    assert all("created_at" not in s for s in runs), runs
+
+
+def test_diag_event_lookback_is_configurable(kanban_home):
+    """kanban.diagnostics.event_lookback_hours moves the bound."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  diagnostics:\n    event_lookback_hours: 2\n", encoding="utf-8"
+    )
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag config", assignee="tester")
+        spy = _SpyConn(conn)
+        started = time.time()
+        mod._compute_task_diagnostics(spy, [task_id])
+        finished = time.time()
+
+    _sql, params = _events_statement(spy)
+    expected_cutoff = (started + finished) / 2 - 2 * 3600
+    assert abs(params[-1] - expected_cutoff) <= 120, (params[-1], expected_cutoff)
+
+
+def test_recent_events_still_reach_diagnostics(kanban_home):
+    """Recent events survive the bound; events older than it are not read at all."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="diag recent", assignee="tester")
+        now = time.time()
+        recent_id = _insert_event(conn, task_id, now)
+        ancient_id = _insert_event(conn, task_id, now - 30 * 86400)
+        spy = _SpyConn(conn)
+        mod._compute_task_diagnostics(spy, [task_id])
+        sql, params = _events_statement(spy)
+        rows = list(conn.execute(sql, params))
+
+    read_ids = {r["id"] for r in rows}
+    assert recent_id in read_ids, read_ids
+    assert ancient_id not in read_ids, read_ids
+    assert all(r["task_id"] == task_id for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics event lookback: the rows that anchor a RULE survive the bound
+# ---------------------------------------------------------------------------
+#
+# The rules read the newest blocked / gave_up / hallucination event and the
+# newest clearing event with NO age window. Bounding those rows to the bulk
+# lookback made an old block indistinguishable from "never blocked" (live board:
+# 30.0 d, 23.8 d and 15.1 d blocks rendered no diagnostic at all).
+
+def _diag_kinds(mod, conn, task_id):
+    out = mod._compute_task_diagnostics(conn, [task_id])
+    return {d["kind"] for d in out.get(task_id, [])}
+
+
+def test_blocked_older_than_lookback_still_yields_stuck_in_blocked(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="old block", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "needs input"}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "stuck_in_blocked" in kinds, kinds
+
+
+def test_old_block_cleared_by_old_comment_stays_clear(kanban_home):
+    """The merge must not resurrect a block that a later (also old) comment cleared."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="old block cleared", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "needs input"}))
+        _insert_event(conn, task_id, time.time() - 20 * 86400, kind="commented")
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "stuck_in_blocked" not in kinds, kinds
+
+
+def test_review_block_older_than_lookback_still_yields_deadlock(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        parent = kb.create_task(conn, title="impl phase", assignee="tester")
+        child = kb.create_task(conn, title="waiting child", assignee="tester",
+                               parents=[parent])
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (parent,))
+        conn.commit()
+        _insert_event(conn, parent, time.time() - 30 * 86400, kind="blocked",
+                      payload=json.dumps({"reason": "review-required: 3 files changed"}))
+        kinds = _diag_kinds(mod, conn, parent)
+
+    assert "review_dependency_deadlock" in kinds, kinds
+
+
+def test_hallucinated_cards_older_than_lookback_still_reported(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="phantom cards", assignee="tester")
+        _insert_event(conn, task_id, time.time() - 30 * 86400,
+                      kind="completion_blocked_hallucination",
+                      payload=json.dumps({"phantom_cards": ["t_0000dead"]}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "hallucinated_cards" in kinds, kinds
+
+
+def test_prose_phantom_refs_older_than_lookback_still_reported(kanban_home):
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="phantom refs", assignee="tester")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400,
+                      kind="suspected_hallucinated_references",
+                      payload=json.dumps({"phantom_refs": ["t_0000beef"]}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "prose_phantom_refs" in kinds, kinds
+
+
+def test_terminal_gave_up_older_than_lookback_still_reported(kanban_home):
+    """A terminal-provider trip blocks below the failure threshold; the trip event
+    itself is the only evidence, so it must survive the bound."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        task_id = kb.create_task(conn, title="terminal trip", assignee="tester")
+        conn.execute("UPDATE tasks SET status='blocked', consecutive_failures=1 "
+                     "WHERE id=?", (task_id,))
+        conn.commit()
+        _insert_event(conn, task_id, time.time() - 30 * 86400, kind="gave_up",
+                      payload=json.dumps({"terminal_provider": True}))
+        kinds = _diag_kinds(mod, conn, task_id)
+
+    assert "repeated_failures" in kinds, kinds
+
+
+def test_task_events_kind_index_exists(kanban_home):
+    """The unbounded newest-of-kind lookup needs the (kind, id) index to stay off
+    a full task_events scan (~160 ms -> ~5 ms on a 441k-row board)."""
+    mod = _load_plugin_module()
+    with mod._board_conn(None) as (_board, conn):
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_events'")}
+
+    assert "idx_events_kind" in names, names
