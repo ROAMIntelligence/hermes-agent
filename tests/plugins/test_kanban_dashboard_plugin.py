@@ -63,6 +63,16 @@ def client(kanban_home):
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
 
+
+@pytest.fixture
+def plugin_client(kanban_home):
+    """Like ``client`` but also returns the loaded plugin module, so tests can
+    inspect the encoded-board cache the module holds."""
+    mod = _load_plugin_module()
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    return mod, TestClient(app)
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -113,6 +123,78 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+def test_board_lists_without_bodies_while_detail_keeps_them(plugin_client):
+    """The list shape drops task bodies (they were 81 % of the payload); the
+    drawer's ``GET /tasks/{id}`` keeps the full text."""
+    _mod, client = plugin_client
+    body = "**Goal**\n" + ("detail " * 800)
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Fat card", "body": body, "assignee": "researcher"},
+    ).json()["task"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = next(t for c in board["columns"] for t in c["tasks"] if t["id"] == created["id"])
+    assert card["body"] is None
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{created['id']}").json()["task"]
+    assert detail["body"] == body
+
+
+def test_board_encoded_payload_is_shared_within_ttl_and_rebuilt_after(plugin_client, monkeypatch):
+    """A burst of clients inside one poll interval must pay for one rebuild."""
+    mod, client = plugin_client
+    calls = {"n": 0}
+    real_list_tasks = kb.list_tasks
+
+    def counting_list_tasks(*args, **kwargs):
+        calls["n"] += 1
+        return real_list_tasks(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "list_tasks", counting_list_tasks)
+
+    first = client.get("/api/plugins/kanban/board")
+    assert first.status_code == 200
+    assert calls["n"] == 1
+    second = client.get("/api/plugins/kanban/board")
+    assert second.status_code == 200
+    assert second.json()["latest_event_id"] == first.json()["latest_event_id"]
+    assert calls["n"] == 1, "second poll inside the TTL rebuilt the board"
+
+    # Distinguish the board/tenant axes: a different key must rebuild immediately.
+    client.get("/api/plugins/kanban/board?tenant=nobody")
+    assert calls["n"] == 2
+
+    # Expiry: with the TTL at zero the next poll rebuilds.
+    monkeypatch.setattr(mod, "_BOARD_CACHE_TTL_S", 0.0)
+    client.get("/api/plugins/kanban/board")
+    assert calls["n"] == 3
+
+
+def test_board_cache_survives_an_external_write_but_drops_on_api_mutation(plugin_client):
+    """The cache is invalidated by dashboard mutations, not by other processes:
+    the gateway/dispatcher write continuously and the SPA's poll is the staleness
+    unit, so an out-of-process write costs at most one TTL of latency."""
+    mod, client = plugin_client
+    client.get("/api/plugins/kanban/board")
+    assert mod._board_cache
+
+    # A write from another connection (gateway/dispatcher/CLI) must not drop it.
+    conn = kbc.connect()
+    try:
+        kb.create_task(conn, title="written by another process")
+    finally:
+        conn.close()
+
+    assert mod._board_cache, "an external write defeated the encoded-board cache"
+
+    # A mutation through this API must drop it, so the user's own move never snaps back.
+    client.post("/api/plugins/kanban/tasks", json={"title": "cache buster"})
+    assert mod._board_cache == {}
+    board = client.get("/api/plugins/kanban/board").json()
+    assert any(t["title"] == "cache buster" for c in board["columns"] for t in c["tasks"])
+
 
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""

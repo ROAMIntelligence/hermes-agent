@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
-from fastapi.responses import FileResponse
+    APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
+    WebSocket, WebSocketDisconnect, status as http_status)
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from starlette.requests import HTTPConnection
 
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
@@ -39,7 +41,18 @@ from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_pa
 
 log = logging.getLogger(__name__)
 
-router = APIRouter()
+
+async def _invalidate_on_mutation(conn: HTTPConnection) -> None:
+    """Router-level dependency: a mutating dashboard call drops the board cache.
+
+    ``HTTPConnection`` (not ``Request``) so the same dependency can sit on the
+    router that also carries the ``/ws/events`` websocket route.
+    """
+    if conn.scope.get("method", "GET") not in ("GET", "HEAD", "OPTIONS"):
+        _invalidate_board_cache()
+
+
+router = APIRouter(dependencies=[Depends(_invalidate_on_mutation)])
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
@@ -97,6 +110,47 @@ def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.C
     board = _resolve_board(board)
     with closing(_conn(board=board)) as conn:
         yield board, conn
+
+
+# --- Encoded board cache ----------------------------------------------------
+#
+# ``GET /board`` rebuilt and re-encoded the whole payload on every client poll —
+# 36.5 MB of JSON per call at 1.27 calls/s on the live board, 92 % of sampled
+# dashboard CPU in ``jsonable_encoder``/``iterencode``, and the dominant source of
+# this process's allocation churn (t_de536fc1). ``coalesced_read`` only collapses
+# *in-flight* duplicates, so spaced polls each paid the full cost.
+#
+# The SPA polls every 2 s per client; a TTL equal to that poll interval lets a
+# burst of clients share one build + one encode, and the cache holds encoded
+# bytes so a hit is a memcpy, not a re-encode. Freshness bound: one poll.
+#
+# Invalidation is deliberately *not* on every write: the gateway and dispatcher
+# write to this DB continuously (a 1 Hz writer is enough to defeat the cache),
+# and a board poll is already the SPA's staleness unit. Mutations that arrive
+# through this dashboard API invalidate up front (``_invalidate_on_mutation``)
+# so a card the user just moved does not snap back on the next poll; writes from
+# other processes appear on the next TTL boundary, i.e. within one poll.
+_BOARD_CACHE_TTL_S = 2.0
+_BOARD_CACHE_MAX = 16
+_board_cache: dict[tuple, tuple[float, bytes]] = {}
+
+
+def _invalidate_board_cache() -> None:
+    _board_cache.clear()
+
+
+def _board_cache_key(tenant, include_archived, board, workflow_template_id, current_step_key) -> tuple:
+    from hermes_constants import get_hermes_home
+    return (str(get_hermes_home()), tenant, bool(include_archived), board,
+            workflow_template_id, current_step_key)
+
+
+def _encode_board(payload: dict) -> bytes:
+    """Encode exactly like Starlette's ``JSONResponse`` (compact separators, UTF-8)."""
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
 
 
 def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:
@@ -184,6 +238,22 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
+    return d
+
+
+def _board_card_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
+                     current_run_started_at: Optional[int] = None) -> dict[str, Any]:
+    """List shape for ``GET /board``: no task body.
+
+    Bodies are ~81 % of the board payload (~25 MB of ~31 MB on the live board) and the
+    card grid never renders them — the drawer fetches the full task from
+    ``GET /tasks/{id}``, which keeps its body. Omitting them cuts the per-poll rebuild
+    and re-encode roughly in half a dozen times, which is where this dashboard's
+    allocation churn came from (t_de536fc1).
+    """
+    d = _task_dict(task, latest_summary=latest_summary,
+                   current_run_started_at=current_run_started_at)
+    d["body"] = None
     return d
 
 
@@ -414,8 +484,8 @@ def get_board(
         run_start_map = kanban_db.current_run_started_ats(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
-                           current_run_started_at=run_start_map.get(t.id))
+            d = _board_card_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                                 current_run_started_at=run_start_map.get(t.id))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -449,13 +519,24 @@ async def get_board_endpoint(
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
 ):
     # Resolve selection before keying so a board switch cannot join an older read.
-    return await _read_board(
+    board_slug = board or kanban_db.get_current_board()
+    key = _board_cache_key(tenant, include_archived, board_slug,
+                           workflow_template_id, current_step_key)
+    cached = _board_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _BOARD_CACHE_TTL_S:
+        return Response(content=cached[1], media_type="application/json")
+    payload = await _read_board(
         tenant=tenant,
         include_archived=include_archived,
-        board=board or kanban_db.get_current_board(),
+        board=board_slug,
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
     )
+    encoded = _encode_board(payload)
+    _board_cache[key] = (time.monotonic(), encoded)
+    while len(_board_cache) > _BOARD_CACHE_MAX:
+        _board_cache.pop(next(iter(_board_cache)))
+    return Response(content=encoded, media_type="application/json")
 
 
 # --- GET /tasks/:id ---------------------------------------------------------
